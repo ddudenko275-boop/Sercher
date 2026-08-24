@@ -1,23 +1,23 @@
-"""Сборщик объявлений с Авито через Playwright.
+"""Сбор объявлений с Авито через Playwright — одной сессией Chrome на проход.
 
-Проверенная рабочая формула против антибота (см. config):
-  • реальный Chrome (channel="chrome"), не встроенный Chromium;
-  • отдельный «прогретый» профиль с cookies;
-  • без блокировки ресурсов (иначе ломается JS-челлендж);
-  • прогрев через главную и спокойный темп.
+Проверенная формула против антибота (см. config): настоящий Chrome
+(channel="chrome"), отдельный прогретый профиль с cookies, без блокировки
+ресурсов, спокойный темп.
 
-Две задачи:
-  fetch_listings()  — распарсить страницу ВЫДАЧИ в список Listing (id/title/price/url);
-  fetch_details()   — открыть страницу ОБЪЯВЛЕНИЯ и достать описание+регион
-                      (нужно, когда веса нет в заголовке).
+AvitoSession открывает Chrome один раз (context manager) и в рамках одной
+сессии умеет:
+  fetch_listings(pages)  — распарсить N страниц выдачи в список Listing;
+  fetch_details(url)     — открыть страницу объявления, вернуть описание+регион.
 
 Запуск проверки: python -m pricewatch.collector
 """
 
 from __future__ import annotations
 
+import random
 import re
 import sys
+import time
 
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -34,74 +34,80 @@ class AccessBlocked(RuntimeError):
     """Авито отдал заглушку антибота вместо страницы."""
 
 
-def _launch(p):
-    ctx = p.chromium.launch_persistent_context(
-        config.PROFILE_DIR,
-        channel=config.CHROME_CHANNEL,
-        headless=config.HEADLESS,
-        locale="ru-RU",
-        viewport={"width": 1366, "height": 900},
-        ignore_default_args=["--enable-automation"],
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    ctx.add_init_script(_STEALTH)
-    return ctx
+class AvitoSession:
+    """Одна сессия браузера: прогрев + сбор выдачи + дозагрузка объявлений."""
 
+    def __enter__(self) -> "AvitoSession":
+        self._pw = sync_playwright().start()
+        self.ctx = self._pw.chromium.launch_persistent_context(
+            config.PROFILE_DIR,
+            channel=config.CHROME_CHANNEL,
+            headless=config.HEADLESS,
+            locale="ru-RU",
+            viewport={"width": 1366, "height": 900},
+            ignore_default_args=["--enable-automation"],
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        self.ctx.add_init_script(_STEALTH)
+        self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+        if config.WARMUP:
+            self.page.goto(_HOME, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
+            self.page.wait_for_timeout(2500)
+        return self
 
-def _check_blocked(page) -> None:
-    if _BLOCK_MARKER in (page.title() or "").lower():
-        raise AccessBlocked(f"заглушка антибота (title={page.title()!r})")
-
-
-def fetch_listings(search_url: str | None = None) -> list[Listing]:
-    """Распарсить страницу выдачи в список Listing (id/title/price/url)."""
-    url = search_url or config.AVITO_SEARCH_URL
-    listings: list[Listing] = []
-
-    with sync_playwright() as p:
-        ctx = _launch(p)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    def __exit__(self, *exc) -> None:
         try:
-            if config.WARMUP:
-                page.goto(_HOME, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
-                page.wait_for_timeout(2500)
-            page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
-            page.wait_for_timeout(2500)
-            _check_blocked(page)
-            page.wait_for_selector('[data-marker="item"]', timeout=config.NAV_TIMEOUT_MS)
-            for card in page.query_selector_all('[data-marker="item"]'):
+            self.ctx.close()
+        finally:
+            self._pw.stop()
+
+    def _check_blocked(self) -> None:
+        if _BLOCK_MARKER in (self.page.title() or "").lower():
+            raise AccessBlocked(f"заглушка антибота (title={self.page.title()!r})")
+
+    def fetch_listings(self, pages: int = 1, search_url: str | None = None) -> list[Listing]:
+        base = search_url or config.AVITO_SEARCH_URL
+        out: list[Listing] = []
+        for n in range(1, pages + 1):
+            url = base if n == 1 else f"{base}&p={n}"
+            self.page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
+            self.page.wait_for_timeout(2500)
+            self._check_blocked()
+            try:
+                self.page.wait_for_selector('[data-marker="item"]', timeout=config.NAV_TIMEOUT_MS)
+            except PWTimeout as e:
+                raise AccessBlocked("карточки не появились — антибот или разметка") from e
+            for card in self.page.query_selector_all('[data-marker="item"]'):
                 listing = _parse_card(card)
                 if listing is not None:
-                    listings.append(listing)
-        except PWTimeout as e:
-            raise AccessBlocked("карточки не появились — антибот или сменилась разметка") from e
-        finally:
-            ctx.close()
+                    out.append(listing)
+            time.sleep(random.uniform(1.5, 3.0))  # темп между страницами
+        return out
 
-    return listings
-
-
-def fetch_details(url: str) -> dict:
-    """Открыть страницу объявления, вернуть {'description', 'region'}."""
-    with sync_playwright() as p:
-        ctx = _launch(p)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
-            page.wait_for_timeout(2500)
-            _check_blocked(page)
-            desc = _first_text(page, [
+    def fetch_details(self, url: str) -> dict:
+        self.page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
+        self.page.wait_for_timeout(2000)
+        self._check_blocked()
+        return {
+            "description": _first_text(self.page, [
                 '[data-marker="item-view/item-description"]',
                 'div[itemprop="description"]',
-            ])
-            region = _first_text(page, [
+            ]),
+            "region": _first_text(self.page, [
                 '[data-marker="item-view/item-address"]',
                 'div[itemprop="address"]',
-            ])
-            return {"description": desc, "region": region}
-        finally:
-            ctx.close()
+            ]),
+        }
 
+
+# --- Тонкие обёртки для разовых вызовов / демо ---
+
+def fetch_listings(search_url: str | None = None, pages: int = 1) -> list[Listing]:
+    with AvitoSession() as s:
+        return s.fetch_listings(pages=pages, search_url=search_url)
+
+
+# --- Парсинг ---
 
 def _parse_card(card) -> Listing | None:
     item_id = card.get_attribute("data-item-id")
@@ -111,9 +117,13 @@ def _parse_card(card) -> Listing | None:
     href = title_el.get_attribute("href") or ""
     url = href if href.startswith("http") else f"https://www.avito.ru{href}"
     title = (title_el.inner_text() or "").strip()
-    price = _parse_price(card)
-    region = _card_region(card)
-    return Listing(id=str(item_id), title=title, price=price, url=url, region=region)
+    return Listing(
+        id=str(item_id),
+        title=title,
+        price=_parse_price(card),
+        url=url,
+        region=_card_region(card),
+    )
 
 
 def _parse_price(card) -> int | None:
@@ -149,7 +159,7 @@ def _first_text(page, selectors) -> str:
 
 def _main() -> int:
     try:
-        listings = fetch_listings()
+        listings = fetch_listings(pages=config.PAGES)
     except AccessBlocked as e:
         print(f"[БЛОКИРОВКА] {e}", file=sys.stderr)
         return 1

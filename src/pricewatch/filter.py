@@ -25,6 +25,11 @@ def evaluate(listing: Listing) -> MatchResult:
     if not extract.has_proba_585(text):
         return MatchResult(False, "не 585 пробы")
 
+    # Регион проверяем рано: если он известен (из карточки) и далёкий — отсекаем
+    # СРАЗУ, не открывая ради веса страницу дальнего объявления.
+    if _is_far(listing.region):
+        return MatchResult(False, f"слишком далеко: {listing.region}")
+
     weight, ambiguous = extract.parse_weight_grams(text)
     if weight is None:
         # 585 есть, но вес в тексте не указан — кандидат на дозагрузку страницы.
@@ -41,17 +46,10 @@ def evaluate(listing: Listing) -> MatchResult:
             weight_g=weight, price_per_gram=ppg, ambiguous_weight=ambiguous,
         )
 
-    # Цена подходит — проверяем доставку и дальность.
-    # has_delivery is None (неизвестно) не отсекаем: считаем, что сохранённый
-    # поиск на Авито уже отфильтровал по «Авито Доставке».
+    # Цена подходит. Доставка (если бы требовалась) — регион уже проверен выше.
     if config.REQUIRE_DELIVERY and listing.has_delivery is False:
         return MatchResult(
             False, "нет Авито Доставки",
-            weight_g=weight, price_per_gram=ppg, ambiguous_weight=ambiguous,
-        )
-    if _is_far(listing.region):
-        return MatchResult(
-            False, f"слишком далеко: {listing.region}",
             weight_g=weight, price_per_gram=ppg, ambiguous_weight=ambiguous,
         )
 

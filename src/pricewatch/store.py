@@ -37,39 +37,31 @@ def is_empty(conn: sqlite3.Connection) -> bool:
     return conn.execute("SELECT 1 FROM seen LIMIT 1").fetchone() is None
 
 
-def classify(conn: sqlite3.Connection, listing: Listing) -> str:
-    """Вернуть тип события и обновить запись.
+def get_prev_price(conn: sqlite3.Connection, listing_id: str) -> tuple[bool, int | None]:
+    """Вернуть (видели_ли_раньше, прежняя_цена). Ничего не пишет."""
+    row = conn.execute(
+        "SELECT last_price FROM seen WHERE id = ?", (listing_id,)
+    ).fetchone()
+    if row is None:
+        return False, None
+    return True, row[0]
 
-    "new"        — объявление раньше не видели;
-    "price_drop" — виденное, но цена стала ниже прежней;
-    "seen"       — виденное без снижения цены (уведомлять не нужно).
-    """
+
+def record(conn: sqlite3.Connection, listing: Listing) -> None:
+    """Зафиксировать объявление как обработанное (вставить/обновить цену)."""
     now = time.time()
     row = conn.execute(
-        "SELECT last_price FROM seen WHERE id = ?", (listing.id,)
+        "SELECT 1 FROM seen WHERE id = ?", (listing.id,)
     ).fetchone()
-
     if row is None:
         conn.execute(
             "INSERT INTO seen (id, first_price, last_price, first_seen, last_seen) "
             "VALUES (?, ?, ?, ?, ?)",
             (listing.id, listing.price, listing.price, now, now),
         )
-        conn.commit()
-        return "new"
-
-    prev_price = row[0]
-    event = "seen"
-    if (
-        listing.price is not None
-        and prev_price is not None
-        and listing.price < prev_price
-    ):
-        event = "price_drop"
-
-    conn.execute(
-        "UPDATE seen SET last_price = ?, last_seen = ? WHERE id = ?",
-        (listing.price, now, listing.id),
-    )
+    else:
+        conn.execute(
+            "UPDATE seen SET last_price = ?, last_seen = ? WHERE id = ?",
+            (listing.price, now, listing.id),
+        )
     conn.commit()
-    return event

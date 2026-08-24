@@ -1,7 +1,9 @@
 """Один проход монитора: выдача → дедуп → фильтр → (дозагрузка) → Telegram.
 
-Запускается по расписанию (Планировщик задач Windows / cron) — один проход за
-вызов, интервал задаёт планировщик. Так проще и надёжнее долгоживущего процесса.
+Запускается по расписанию (Планировщик задач Windows) — один проход за вызов.
+Первый прогон идёт глубже и уже уведомляет о подходящих текущих предложениях.
+Открытий страниц объявлений за проход не больше MAX_DETAIL_FETCHES — что не
+успели, добираем на следующих проходах (без долбёжки Авито).
 
 Запуск: python -m pricewatch
 """
@@ -19,54 +21,65 @@ from .filter import evaluate
 def run_once() -> int:
     """Вернуть число отправленных уведомлений."""
     conn = store.connect(config.DB_PATH)
-
-    try:
-        listings = collector.fetch_listings()
-    except AccessBlocked as e:
-        notify.send(f"⚠ Sercher: Авито заблокировал сбор — {e}")
-        print(f"[БЛОКИРОВКА] {e}")
-        return 0
-
-    print(f"Карточек в выдаче: {len(listings)}")
-
-    # Первый запуск: только запоминаем текущее состояние, ничего не шлём и не
-    # дозагружаем — иначе завалим Авито десятками заходов на страницы.
-    if store.is_empty(conn):
-        for listing in listings:
-            store.classify(conn, listing)
-        print("Базовая линия установлена (первый запуск, уведомлений нет).")
-        return 0
+    first_run = store.is_empty(conn)
+    pages = config.FIRST_RUN_PAGES if first_run else config.PAGES
 
     sent = 0
+    fetches = 0
 
-    for listing in listings:
-        event = store.classify(conn, listing)
-        if event == "seen":
-            continue  # уже видели без снижения цены — не трогаем
-
-        result = evaluate(listing)
-
-        # Веса нет в заголовке/сниппете — открываем страницу объявления.
-        if result.needs_page:
-            time.sleep(random.uniform(2.0, 5.0))  # спокойный темп
+    try:
+        with collector.AvitoSession() as sess:
             try:
-                details = collector.fetch_details(listing.url)
+                listings = sess.fetch_listings(pages=pages)
             except AccessBlocked as e:
-                print(f"  пропуск {listing.id}: {e}")
-                continue
-            listing.description = details.get("description", "")
-            if details.get("region"):
-                listing.region = details["region"]
-            result = evaluate(listing)
+                notify.send(f"⚠ Sercher: Авито заблокировал сбор — {e}")
+                print(f"[БЛОКИРОВКА] {e}")
+                return 0
 
-        if result.matched:
-            notify.send(notify.format_message(listing, result, event))
-            sent += 1
-            print(f"  ✅ {result.reason} — {listing.title}")
+            print(f"Карточек в выдаче: {len(listings)} (страниц: {pages}, "
+                  f"первый прогон: {first_run})")
 
-    print(f"Отправлено уведомлений: {sent}")
+            for listing in listings:
+                seen, prev_price = store.get_prev_price(conn, listing.id)
+                if seen:
+                    # Виденное: интересует только снижение цены.
+                    if (listing.price is None or prev_price is None
+                            or listing.price >= prev_price):
+                        continue
+                    event = "price_drop"
+                else:
+                    event = "new"
+
+                result = evaluate(listing)
+
+                # Веса нет в тексте карточки — открываем страницу (в пределах лимита).
+                if result.needs_page:
+                    if fetches >= config.MAX_DETAIL_FETCHES:
+                        continue  # не записываем — добёрём на следующем проходе
+                    fetches += 1
+                    time.sleep(random.uniform(2.0, 5.0))
+                    try:
+                        details = sess.fetch_details(listing.url)
+                    except AccessBlocked as e:
+                        print(f"  пропуск {listing.id}: {e}")
+                        continue  # тоже не записываем — повторим позже
+                    listing.description = details.get("description", "")
+                    if details.get("region"):
+                        listing.region = details["region"]
+                    result = evaluate(listing)
+
+                store.record(conn, listing)
+
+                if result.matched:
+                    notify.send(notify.format_message(listing, result, event))
+                    sent += 1
+                    print(f"  ✅ {result.reason} — {listing.title}")
+    finally:
+        conn.close()
+
+    print(f"Открыто страниц объявлений: {fetches} | отправлено уведомлений: {sent}")
     return sent
 
 
 if __name__ == "__main__":
-    raise SystemExit(0 if run_once() >= 0 else 1)
+    run_once()
