@@ -23,11 +23,15 @@ CREATE TABLE IF NOT EXISTS seen (
 """
 
 
+_META_SCHEMA = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);"
+
+
 def connect(db_path: str | Path) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute(_SCHEMA)
+    conn.execute(_META_SCHEMA)
     conn.commit()
     return conn
 
@@ -35,6 +39,21 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 def is_empty(conn: sqlite3.Connection) -> bool:
     """База пуста? (первый запуск — нужна базовая линия, без уведомлений)."""
     return conn.execute("SELECT 1 FROM seen LIMIT 1").fetchone() is None
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    """Прочитать служебное значение (напр. индекс ротации колец)."""
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, str(value)),
+    )
+    conn.commit()
 
 
 def get_prev_price(conn: sqlite3.Connection, listing_id: str) -> tuple[bool, int | None]:

@@ -31,6 +31,8 @@ def format_message(listing: Listing, result: MatchResult, event: str = "new") ->
         lines.append(f"За грамм: <b>{result.price_per_gram:,.0f} ₽/г</b>".replace(",", " "))
     if result.weight_g is not None:
         lines.append(f"Вес: {result.weight_g:g} г")
+    if listing.region:
+        lines.append(f"Регион: {_escape(listing.region)}")
     if result.ambiguous_weight:
         lines.append("⚠ вес неоднозначный — проверь вручную")
     if listing.url:

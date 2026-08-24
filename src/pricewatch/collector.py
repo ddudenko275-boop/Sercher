@@ -67,7 +67,7 @@ class AvitoSession:
             raise AccessBlocked(f"заглушка антибота (title={self.page.title()!r})")
 
     def fetch_listings(self, pages: int = 1, search_url: str | None = None) -> list[Listing]:
-        base = search_url or config.AVITO_SEARCH_URL
+        base = search_url or config.SEARCH_URL_TEMPLATE.format(region="moskva")
         out: list[Listing] = []
         for n in range(1, pages + 1):
             url = base if n == 1 else f"{base}&p={n}"
