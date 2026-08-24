@@ -1,0 +1,20 @@
+# Секреты и настройки
+.env
+
+# Данные монитора (локальная база и логи)
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Playwright (браузеры ставятся отдельно)
+.pw-browsers/
