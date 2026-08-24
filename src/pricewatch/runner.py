@@ -63,6 +63,9 @@ def run_once() -> int:
                     except AccessBlocked as e:
                         print(f"  пропуск {listing.id}: {e}")
                         continue  # тоже не записываем — повторим позже
+                    except Exception as e:  # проблема одной страницы не валит прогон
+                        print(f"  пропуск {listing.id}: {type(e).__name__}: {e}")
+                        continue
                     listing.description = details.get("description", "")
                     if details.get("region"):
                         listing.region = details["region"]

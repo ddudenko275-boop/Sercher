@@ -19,6 +19,7 @@ import re
 import sys
 import time
 
+from playwright.sync_api import Error as PWError
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
@@ -85,19 +86,42 @@ class AvitoSession:
         return out
 
     def fetch_details(self, url: str) -> dict:
-        self.page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
-        self.page.wait_for_timeout(2000)
-        self._check_blocked()
-        return {
-            "description": _first_text(self.page, [
-                '[data-marker="item-view/item-description"]',
-                'div[itemprop="description"]',
-            ]),
-            "region": _first_text(self.page, [
-                '[data-marker="item-view/item-address"]',
-                'div[itemprop="address"]',
-            ]),
-        }
+        # Убираем трекинг-параметры (?context=...): из-за них страница делает
+        # клиентский редирект, и запрос к DOM падает «context was destroyed».
+        clean_url = url.split("?", 1)[0]
+
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                self.page.goto(clean_url, wait_until="domcontentloaded",
+                               timeout=config.NAV_TIMEOUT_MS)
+                self.page.wait_for_timeout(2500)
+                self._check_blocked()
+                # Дождаться описания/заголовка — заодно переживаем доп. навигацию.
+                try:
+                    self.page.wait_for_selector(
+                        '[data-marker="item-view/item-description"], h1',
+                        timeout=10_000,
+                    )
+                except PWTimeout:
+                    pass
+                return {
+                    "description": _first_text(self.page, [
+                        '[data-marker="item-view/item-description"]',
+                        'div[itemprop="description"]',
+                    ]),
+                    "region": _first_text(self.page, [
+                        '[data-marker="item-view/item-address"]',
+                        'div[itemprop="address"]',
+                    ]),
+                }
+            except PWError as e:
+                last_err = e
+                if "context was destroyed" in str(e) and attempt == 0:
+                    self.page.wait_for_timeout(1500)
+                    continue
+                raise
+        raise last_err  # pragma: no cover
 
 
 # --- Тонкие обёртки для разовых вызовов / демо ---
