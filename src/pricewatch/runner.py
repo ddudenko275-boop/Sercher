@@ -47,7 +47,7 @@ def _fetch_region(sess, slug: str, pages: int):
             return sess.fetch_listings(search_url=url, pages=pages)
         except AccessBlocked:
             if attempt == 0:
-                time.sleep(random.uniform(3.0, 6.0))
+                time.sleep(random.uniform(5.0, 9.0))
                 continue
             raise
 
@@ -112,7 +112,7 @@ def run_once() -> int:
                         sent += 1
                         print(f"  ✅ [{region_name}] {result.reason} — {listing.title}")
 
-                time.sleep(random.uniform(1.5, 3.0))  # пауза между регионами
+                time.sleep(random.uniform(4.0, 8.0))  # пауза между регионами — меньше блоков
     finally:
         conn.close()
 
