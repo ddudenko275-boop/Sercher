@@ -28,7 +28,7 @@ def main() -> int:
     print(f"{'Итог':<6} {'₽/г':>8}  Причина / объявление")
     print("-" * 70)
     for title, desc, price in SAMPLES:
-        listing = Listing(id="0", title=title, price=price, url="", description=desc)
+        listing = Listing(id="0", title=title, price=price, url="", description=desc, detailed=True)
         r = evaluate(listing)
         mark = "✅" if r.matched else ("📄" if r.needs_page else "❌")
         ppg = f"{r.price_per_gram:,.0f}".replace(",", " ") if r.price_per_gram else "—"

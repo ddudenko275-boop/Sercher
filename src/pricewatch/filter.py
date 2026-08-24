@@ -20,20 +20,23 @@ class MatchResult:
 
 def evaluate(listing: Listing) -> MatchResult:
     """Прогнать объявление через жёсткие условия."""
-    text = f"{listing.title} {listing.description}"
-
-    if not extract.has_proba_585(text):
-        return MatchResult(False, "не 585 пробы")
-
-    # Регион проверяем рано: если он известен (из карточки) и далёкий — отсекаем
-    # СРАЗУ, не открывая ради веса страницу дальнего объявления.
+    # Дальний регион — отсекаем СРАЗУ (регион есть уже из карточки), не открывая
+    # ради веса страницу заведомо далёкого объявления.
     if _is_far(listing.region):
         return MatchResult(False, f"слишком далеко: {listing.region}")
 
+    text = f"{listing.title} {listing.description}"
+    has_585 = extract.has_proba_585(text)
     weight, ambiguous = extract.parse_weight_grams(text)
-    if weight is None:
-        # 585 есть, но вес в тексте не указан — кандидат на дозагрузку страницы.
-        return MatchResult(False, "вес не найден в тексте", needs_page=True)
+
+    # Проба и вес часто лежат ТОЛЬКО в описании (и бывают обфусцированы). Если
+    # по имеющемуся тексту чего-то нет и страницу мы ещё не открывали — открываем.
+    # Отказываем «не 585 / вес не найден» лишь когда страница уже прочитана.
+    if not has_585 or weight is None:
+        if not listing.detailed:
+            return MatchResult(False, "нужна страница", needs_page=True)
+        reason = "не 585 пробы" if not has_585 else "вес не найден"
+        return MatchResult(False, reason, weight_g=weight, ambiguous_weight=ambiguous)
 
     if listing.price is None:
         return MatchResult(False, "цена не указана", weight_g=weight, ambiguous_weight=ambiguous)

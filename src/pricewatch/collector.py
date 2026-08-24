@@ -140,11 +140,20 @@ def _parse_price(card) -> int | None:
     return None
 
 
+# Регион в карточке лежит в <p> без data-marker и с хешированными классами
+# («Ростовская обл., Таганрог»). Ищем по гео-словам — устойчиво к смене вёрстки.
+_REGION_RX = re.compile(
+    r"(област|\bобл\b|\bобл\.|кра[йяю]|респ|окру|Москв|Санкт|Петербург|Ленинградск|\bр-н\b|район)",
+    re.IGNORECASE,
+)
+
+
 def _card_region(card) -> str:
-    el = card.query_selector('[data-marker="item-address"]') or card.query_selector(
-        'div[class*="geo"]'
-    )
-    return (el.inner_text() or "").strip() if el else ""
+    for el in card.query_selector_all("p"):
+        t = (el.inner_text() or "").strip()
+        if t and len(t) <= 60 and _REGION_RX.search(t):
+            return t
+    return ""
 
 
 def _first_text(page, selectors) -> str:

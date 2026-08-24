@@ -16,6 +16,7 @@ class Listing:
     description: str = ""  # текст объявления/сниппет — отсюда достаём вес и пробу
     region: str = ""       # регион продавца (для оценки дальности доставки)
     has_delivery: bool | None = None  # доступна ли Авито Доставка; None — неизвестно
+    detailed: bool = False  # прочитали ли страницу объявления (описание/регион)
     source: str = "avito"
 
     def __str__(self) -> str:

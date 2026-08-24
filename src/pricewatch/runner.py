@@ -66,6 +66,7 @@ def run_once() -> int:
                     listing.description = details.get("description", "")
                     if details.get("region"):
                         listing.region = details["region"]
+                    listing.detailed = True
                     result = evaluate(listing)
 
                 store.record(conn, listing)
