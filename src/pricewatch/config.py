@@ -12,12 +12,33 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
+
+def _load_dotenv() -> None:
+    """Подтянуть переменные из .env в корне проекта (без сторонних библиотек).
+
+    Нужно, чтобы токен Telegram подхватывался и при запуске из Планировщика,
+    где переменные окружения не заданы. Существующее окружение имеет приоритет.
+    """
+    env_path = Path(__file__).resolve().parents[2] / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        os.environ.setdefault(key.strip(), val.strip())
+
+
+_load_dotenv()
 
 # --- Что отслеживаем ---
 # Золотые украшения 585 пробы. Жёсткие условия Авито (категория, ключевые слова,
 # потолок полной цены) задаём через URL сохранённого поиска — открой Авито,
 # выставь фильтры, скопируй ссылку сюда. s=104 — «по дате: сначала новые».
-AVITO_SEARCH_URL = "https://www.avito.ru/rossiya?q=золото+585&s=104"
+AVITO_SEARCH_URL = "https://www.avito.ru/rossiya/chasy_i_ukrasheniya?q=золото+585&s=104"
 
 # Темп держим низким, чтобы аккаунт не выглядел ботом (одна страница за проход).
 PAGES = 1
@@ -59,7 +80,13 @@ DB_PATH = "data/seen.db"  # локальная база дедупликации
 
 # --- Telegram (создаётся у @BotFather; кладём в .env, а не в код) ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Получателей может быть несколько — перечисли chat id через запятую в .env:
+# TELEGRAM_CHAT_ID=5041766473,123456789
+# Каждый получатель должен один раз нажать «Start» у бота, иначе бот не сможет
+# ему написать (Telegram не разрешает боту писать первым).
+TELEGRAM_CHAT_IDS = [
+    c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()
+]
 
 # --- Поведение браузера (проверенная рабочая формула против антибота Авито) ---
 # Запускаем НАСТОЯЩИЙ Chrome, а не встроенный Chromium — ключевой фактор.

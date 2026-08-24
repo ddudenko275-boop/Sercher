@@ -39,30 +39,34 @@ def format_message(listing: Listing, result: MatchResult, event: str = "new") ->
 
 
 def send(text: str) -> bool:
-    """Отправить сообщение. Вернуть True при успехе; dry-run считается успехом."""
+    """Отправить сообщение всем получателям. dry-run считается успехом."""
     token = config.TELEGRAM_BOT_TOKEN
-    chat_id = config.TELEGRAM_CHAT_ID
+    chat_ids = config.TELEGRAM_CHAT_IDS
 
-    if not token or not chat_id:
+    if not token or not chat_ids:
         print("[dry-run: TELEGRAM не настроен, сообщение не отправлено]\n" + text + "\n")
         return True
 
-    data = urllib.parse.urlencode(
-        {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
-        }
-    ).encode()
-
-    try:
-        with urllib.request.urlopen(_API.format(token=token), data=data, timeout=15) as resp:
-            payload = json.loads(resp.read().decode())
-            return bool(payload.get("ok"))
-    except urllib.error.URLError as e:
-        print(f"[telegram] ошибка отправки: {e}")
-        return False
+    ok_all = True
+    for chat_id in chat_ids:
+        data = urllib.parse.urlencode(
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "false",
+            }
+        ).encode()
+        try:
+            with urllib.request.urlopen(_API.format(token=token), data=data, timeout=15) as resp:
+                payload = json.loads(resp.read().decode())
+                if not payload.get("ok"):
+                    ok_all = False
+                    print(f"[telegram] {chat_id}: не ок — {payload.get('description')}")
+        except urllib.error.URLError as e:
+            ok_all = False
+            print(f"[telegram] {chat_id}: ошибка отправки — {e}")
+    return ok_all
 
 
 def _escape(s: str) -> str:
