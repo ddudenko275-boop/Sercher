@@ -124,6 +124,12 @@ TELEGRAM_CHAT_IDS = [
     c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()
 ]
 
+# --- Прокси (обход блокировок по IP; резидентный, желательно sticky-session) ---
+# Кладём в .env. Пусто — работаем без прокси (как сейчас).
+PROXY_SERVER = os.getenv("PROXY_SERVER", "")        # напр. "http://host:port"
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "")
+
 # --- Поведение браузера (проверенная рабочая формула против антибота Авито) ---
 # Запускаем НАСТОЯЩИЙ Chrome, а не встроенный Chromium — ключевой фактор.
 CHROME_CHANNEL = "chrome"

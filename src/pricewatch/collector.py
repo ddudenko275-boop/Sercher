@@ -44,10 +44,19 @@ class AvitoSession:
         # headed, но окно за пределами экрана — реальный браузер без помех.
         if not config.HEADLESS and getattr(config, "OFFSCREEN", False):
             launch_args += ["--window-position=-32000,-32000", "--window-size=1366,900"]
+
+        proxy = None
+        if config.PROXY_SERVER:
+            proxy = {"server": config.PROXY_SERVER}
+            if config.PROXY_USERNAME:
+                proxy["username"] = config.PROXY_USERNAME
+                proxy["password"] = config.PROXY_PASSWORD
+
         self.ctx = self._pw.chromium.launch_persistent_context(
             config.PROFILE_DIR,
             channel=config.CHROME_CHANNEL,
             headless=config.HEADLESS,
+            proxy=proxy,
             locale="ru-RU",
             viewport={"width": 1366, "height": 900},
             ignore_default_args=["--enable-automation"],
@@ -75,7 +84,10 @@ class AvitoSession:
         for attempt in range(config.BLOCK_RETRIES + 1):
             blocked = False
             try:
-                self.page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
+                resp = self.page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
+                # 404 = объявление удалено/продано. Ретраить бессмысленно — сразу скип.
+                if resp is not None and resp.status == 404:
+                    raise AccessBlocked("404 — объявление удалено/продано")
                 self.page.wait_for_timeout(2500)
                 if _BLOCK_MARKER in (self.page.title() or "").lower():
                     blocked = True
