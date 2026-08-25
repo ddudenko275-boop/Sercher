@@ -40,6 +40,10 @@ class AvitoSession:
 
     def __enter__(self) -> "AvitoSession":
         self._pw = sync_playwright().start()
+        launch_args = ["--disable-blink-features=AutomationControlled"]
+        # headed, но окно за пределами экрана — реальный браузер без помех.
+        if not config.HEADLESS and getattr(config, "OFFSCREEN", False):
+            launch_args += ["--window-position=-32000,-32000", "--window-size=1366,900"]
         self.ctx = self._pw.chromium.launch_persistent_context(
             config.PROFILE_DIR,
             channel=config.CHROME_CHANNEL,
@@ -47,7 +51,7 @@ class AvitoSession:
             locale="ru-RU",
             viewport={"width": 1366, "height": 900},
             ignore_default_args=["--enable-automation"],
-            args=["--disable-blink-features=AutomationControlled"],
+            args=launch_args,
         )
         self.ctx.add_init_script(_STEALTH)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
@@ -62,22 +66,41 @@ class AvitoSession:
         finally:
             self._pw.stop()
 
-    def _check_blocked(self) -> None:
-        if _BLOCK_MARKER in (self.page.title() or "").lower():
-            raise AccessBlocked(f"заглушка антибота (title={self.page.title()!r})")
+    def _open(self, url: str, need_selector: str) -> None:
+        """Открыть url с ретраем на «мигающий» блок.
+
+        Антибот иногда отдаёт заглушку/пустую страницу даже живому браузеру —
+        в браузере это лечится перезагрузкой. Повторяем до BLOCK_RETRIES раз.
+        """
+        for attempt in range(config.BLOCK_RETRIES + 1):
+            blocked = False
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
+                self.page.wait_for_timeout(2500)
+                if _BLOCK_MARKER in (self.page.title() or "").lower():
+                    blocked = True
+                else:
+                    try:
+                        self.page.wait_for_selector(need_selector, timeout=config.NAV_TIMEOUT_MS)
+                        return  # успех
+                    except PWTimeout:
+                        blocked = True  # нужного элемента нет — мягкий блок
+            except PWError:
+                blocked = True  # навигацию сорвало (редирект/разрушенный контекст)
+
+            if blocked and attempt < config.BLOCK_RETRIES:
+                time.sleep(random.uniform(3.0, 6.0))  # пауза перед перезагрузкой
+
+        raise AccessBlocked(
+            f"заблокировано после {config.BLOCK_RETRIES + 1} попыток (title={self.page.title()!r})"
+        )
 
     def fetch_listings(self, pages: int = 1, search_url: str | None = None) -> list[Listing]:
         base = search_url or config.SEARCH_URL_TEMPLATE.format(region="moskva")
         out: list[Listing] = []
         for n in range(1, pages + 1):
             url = base if n == 1 else f"{base}&p={n}"
-            self.page.goto(url, wait_until="domcontentloaded", timeout=config.NAV_TIMEOUT_MS)
-            self.page.wait_for_timeout(2500)
-            self._check_blocked()
-            try:
-                self.page.wait_for_selector('[data-marker="item"]', timeout=config.NAV_TIMEOUT_MS)
-            except PWTimeout as e:
-                raise AccessBlocked("карточки не появились — антибот или разметка") from e
+            self._open(url, '[data-marker="item"]')
             for card in self.page.query_selector_all('[data-marker="item"]'):
                 listing = _parse_card(card)
                 if listing is not None:
@@ -87,41 +110,19 @@ class AvitoSession:
 
     def fetch_details(self, url: str) -> dict:
         # Убираем трекинг-параметры (?context=...): из-за них страница делает
-        # клиентский редирект, и запрос к DOM падает «context was destroyed».
+        # клиентский редирект. _open переживает это и ретраит на блок.
         clean_url = url.split("?", 1)[0]
-
-        last_err: Exception | None = None
-        for attempt in range(2):
-            try:
-                self.page.goto(clean_url, wait_until="domcontentloaded",
-                               timeout=config.NAV_TIMEOUT_MS)
-                self.page.wait_for_timeout(2500)
-                self._check_blocked()
-                # Дождаться описания/заголовка — заодно переживаем доп. навигацию.
-                try:
-                    self.page.wait_for_selector(
-                        '[data-marker="item-view/item-description"], h1',
-                        timeout=10_000,
-                    )
-                except PWTimeout:
-                    pass
-                return {
-                    "description": _first_text(self.page, [
-                        '[data-marker="item-view/item-description"]',
-                        'div[itemprop="description"]',
-                    ]),
-                    "region": _first_text(self.page, [
-                        '[data-marker="item-view/item-address"]',
-                        'div[itemprop="address"]',
-                    ]),
-                }
-            except PWError as e:
-                last_err = e
-                if "context was destroyed" in str(e) and attempt == 0:
-                    self.page.wait_for_timeout(1500)
-                    continue
-                raise
-        raise last_err  # pragma: no cover
+        self._open(clean_url, '[data-marker="item-view/item-description"], h1')
+        return {
+            "description": _first_text(self.page, [
+                '[data-marker="item-view/item-description"]',
+                'div[itemprop="description"]',
+            ]),
+            "region": _first_text(self.page, [
+                '[data-marker="item-view/item-address"]',
+                'div[itemprop="address"]',
+            ]),
+        }
 
 
 # --- Тонкие обёртки для разовых вызовов / демо ---
