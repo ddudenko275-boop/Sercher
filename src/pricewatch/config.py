@@ -114,6 +114,12 @@ MAX_WEIGHT_G = 1000.0
 # --- Хранилище ---
 DB_PATH = "data/seen.db"  # локальная база дедупликации (в .gitignore)
 
+# --- Сбор через API Авито (spfa cookies + curl_cffi) ---
+# Ключ сервиса spfa.pro (даёт cookies под наш прокси-IP). Кладём в .env.
+SPFA_API_KEY = os.getenv("SPFA_API_KEY", "")
+# Прокси одной строкой: http://логин:пароль@host:порт (или socks5://...).
+PROXY = os.getenv("PROXY", "")
+
 # --- Telegram (создаётся у @BotFather; кладём в .env, а не в код) ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # Получателей может быть несколько — перечисли chat id через запятую в .env:
