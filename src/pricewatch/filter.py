@@ -29,6 +29,10 @@ def evaluate(listing: Listing) -> MatchResult:
     per_gram = extract.is_price_per_gram(text)
     weight, ambiguous = extract.parse_weight_grams(text)
 
+    # Только чистое золото — украшения со вставками/камнями исключаем.
+    if config.EXCLUDE_STONES and extract.has_stones(text):
+        return MatchResult(False, "со вставками/камнями", weight_g=weight)
+
     if per_gram:
         # Цена объявления УЖЕ указана за грамм — на вес НЕ делим.
         if not has_585:
@@ -37,6 +41,8 @@ def evaluate(listing: Listing) -> MatchResult:
             return MatchResult(False, "не 585 пробы")
         if listing.price is None:
             return MatchResult(False, "цена не указана")
+        if not _weight_ok(weight):
+            return MatchResult(False, _weight_reason(weight), weight_g=weight)
         return _decide(float(listing.price), weight, ambiguous)
 
     # Обычная цена (за изделие) — нужен вес, чтобы посчитать ₽/г.
@@ -45,9 +51,26 @@ def evaluate(listing: Listing) -> MatchResult:
             return MatchResult(False, "нужна страница", needs_page=True)
         reason = "не 585 пробы" if not has_585 else "вес не найден"
         return MatchResult(False, reason, weight_g=weight, ambiguous_weight=ambiguous)
+    if not _weight_ok(weight):
+        return MatchResult(False, _weight_reason(weight), weight_g=weight, ambiguous_weight=ambiguous)
     if listing.price is None:
         return MatchResult(False, "цена не указана", weight_g=weight, ambiguous_weight=ambiguous)
     return _decide(listing.price / weight, weight, ambiguous)
+
+
+def _weight_ok(weight: float | None) -> bool:
+    """Проходит ли вес порог «не менее N граммов» (0 — порога нет)."""
+    minimum = config.MIN_ITEM_WEIGHT_G
+    if not minimum:
+        return True
+    return weight is not None and weight >= minimum
+
+
+def _weight_reason(weight: float | None) -> str:
+    minimum = config.MIN_ITEM_WEIGHT_G
+    if weight is None:
+        return f"вес не указан (нужно ≥ {minimum:g} г)"
+    return f"{weight:g} г < {minimum:g} г"
 
 
 def _decide(ppg: float, weight: float | None, ambiguous: bool) -> MatchResult:
