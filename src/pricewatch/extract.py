@@ -44,6 +44,21 @@ def has_proba_585(text: str) -> bool:
     return bool(_PROBA_585_RE.search(_normalize(text)))
 
 
+# Признак «цена объявления указана ЗА ГРАММ» (лом/скупка): «цена за грамм»,
+# «7250 за грамм», «стоимость грамма», «₽/г», «руб/грамм». Тогда делить на вес НЕ надо.
+_PRICE_PER_GRAM_RE = re.compile(
+    r"за\s*(?:1\s*)?грамм"
+    r"|(?:цена|стоимост\w*)\s+(?:за\s+)?(?:1\s*)?грамма?"
+    r"|(?:₽|руб|р)\s*/\s*(?:грамм|гр|г)\b",
+    re.IGNORECASE,
+)
+
+
+def is_price_per_gram(text: str) -> bool:
+    """Указана ли цена ЗА ГРАММ (тогда ₽/г = цена объявления, без деления на вес)."""
+    return bool(_PRICE_PER_GRAM_RE.search(_normalize(text)))
+
+
 def parse_weight_grams(text: str) -> tuple[float | None, bool]:
     """Вернуть (вес_в_граммах, неоднозначно?).
 

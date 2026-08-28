@@ -6,10 +6,9 @@
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.parse
-import urllib.request
+import time
+
+import requests
 
 from . import config
 from .filter import MatchResult
@@ -35,6 +34,9 @@ def format_message(listing: Listing, result: MatchResult, event: str = "new") ->
         lines.append(f"Регион: {_escape(listing.region)}")
     if result.ambiguous_weight:
         lines.append("⚠ вес неоднозначный — проверь вручную")
+    if (result.price_per_gram is not None
+            and result.price_per_gram < config.SUSPICIOUS_PRICE_PER_GRAM):
+        lines.append("⚠️ Подозрительно дёшево (ниже цены лома) — возможно развод, проверь внимательно")
     if listing.url:
         lines.append(listing.url)
     return "\n".join(lines)
@@ -49,25 +51,22 @@ def send(text: str) -> bool:
         print("[dry-run: TELEGRAM не настроен, сообщение не отправлено]\n" + text + "\n")
         return True
 
+    url = _API.format(token=token)
+    payload_base = {"text": text, "parse_mode": "HTML", "disable_web_page_preview": "false"}
     ok_all = True
     for chat_id in chat_ids:
-        data = urllib.parse.urlencode(
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": "false",
-            }
-        ).encode()
-        try:
-            with urllib.request.urlopen(_API.format(token=token), data=data, timeout=15) as resp:
-                payload = json.loads(resp.read().decode())
-                if not payload.get("ok"):
-                    ok_all = False
-                    print(f"[telegram] {chat_id}: не ок — {payload.get('description')}")
-        except urllib.error.URLError as e:
-            ok_all = False
-            print(f"[telegram] {chat_id}: ошибка отправки — {e}")
+        sent = False
+        for attempt in range(3):  # сеть/лимит — пара повторов
+            try:
+                r = requests.post(url, data={**payload_base, "chat_id": chat_id}, timeout=20)
+                if r.json().get("ok"):
+                    sent = True
+                    break
+                print(f"[telegram] {chat_id}: не ок — {r.json().get('description')}")
+            except requests.RequestException as e:
+                print(f"[telegram] {chat_id}: ошибка отправки — {e}")
+            time.sleep(2)
+        ok_all = ok_all and sent
     return ok_all
 
 

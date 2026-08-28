@@ -24,12 +24,13 @@ from .models import Listing
 
 _SPFA = "https://spfa.pro/api"
 _URL_CACHE = Path("data/api_urls.json")
+_COOKIES_CACHE = Path("data/cookies.json")
 
 
 def convert_search_url(search_url: str) -> str:
     """Обычная ссылка поиска Авито → ссылка на API (через spfa, с кэшем на диске).
 
-    Конвертация у spfa бесплатна (лимит ~2/мин), поэтому кэшируем навсегда.
+    Конвертация у spfa бесплатна, но лимит ~2/мин — на 429 ждём и повторяем.
     """
     cache: dict[str, str] = {}
     if _URL_CACHE.exists():
@@ -40,11 +41,17 @@ def convert_search_url(search_url: str) -> str:
     if search_url in cache:
         return cache[search_url]
 
-    r = requests.post(f"{_SPFA}/avito-url/", json={"url": search_url}, timeout=25)
-    r.raise_for_status()
-    api_url = (r.json() or {}).get("api_url")
+    api_url = None
+    for attempt in range(4):
+        r = requests.post(f"{_SPFA}/avito-url/", json={"url": search_url}, timeout=25)
+        if r.status_code == 429:  # лимит spfa — ждём и повторяем
+            time.sleep(32)
+            continue
+        r.raise_for_status()
+        api_url = (r.json() or {}).get("api_url")
+        break
     if not api_url:
-        raise RuntimeError("spfa не вернул api_url")
+        raise RuntimeError("spfa не вернул api_url (лимит или ошибка)")
 
     cache[search_url] = api_url
     _URL_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +69,29 @@ class AvitoApi:
         self._cookies: dict | None = None
         self._fingerprint: dict = {}
         self._user_agent: str | None = None
+        self._load_cookies()
+
+    def _load_cookies(self) -> None:
+        """Подтянуть ранее купленные cookies с диска (чтобы не покупать заново)."""
+        if not _COOKIES_CACHE.exists():
+            return
+        try:
+            d = json.loads(_COOKIES_CACHE.read_text("utf-8"))
+            self._id = d.get("id")
+            self._cookies = d.get("cookies")
+            self._fingerprint = d.get("fingerprint") or {}
+            self._user_agent = d.get("user_agent")
+        except Exception:
+            pass
+
+    def _save_cookies(self) -> None:
+        _COOKIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _COOKIES_CACHE.write_text(json.dumps({
+            "id": self._id,
+            "cookies": self._cookies,
+            "fingerprint": self._fingerprint,
+            "user_agent": self._user_agent,
+        }, ensure_ascii=False), "utf-8")
 
     # --- cookies через spfa ---
     def _buy_cookies(self) -> None:
@@ -80,6 +110,7 @@ class AvitoApi:
         ).get("user-agent")
         if not (self._cookies and self._fingerprint.get("impersonate")):
             raise RuntimeError(f"spfa вернул неполные cookies: {data}")
+        self._save_cookies()
 
     def _unblock_or_rebuy(self) -> None:
         if self._id:
@@ -108,7 +139,9 @@ class AvitoApi:
             s.headers["user-agent"] = self._user_agent
         s.cookies.update(self._cookies or {})
         if self.proxy:
-            s.proxies = {"http": self.proxy, "https": self.proxy}
+            # spfa хранит прокси как «логин:пароль@host:port»; curl_cffi нужна схема.
+            proxy_url = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
+            s.proxies = {"http": proxy_url, "https": proxy_url}
         return s
 
     # --- выдача ---

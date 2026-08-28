@@ -20,44 +20,41 @@ class MatchResult:
 
 def evaluate(listing: Listing) -> MatchResult:
     """Прогнать объявление через жёсткие условия."""
-    # Дальний регион — отсекаем СРАЗУ (регион есть уже из карточки), не открывая
-    # ради веса страницу заведомо далёкого объявления.
+    # Дальний регион — отсекаем сразу (регион есть из карточки/JSON).
     if _is_far(listing.region):
         return MatchResult(False, f"слишком далеко: {listing.region}")
 
     text = f"{listing.title} {listing.description}"
     has_585 = extract.has_proba_585(text)
+    per_gram = extract.is_price_per_gram(text)
     weight, ambiguous = extract.parse_weight_grams(text)
 
-    # Проба и вес часто лежат ТОЛЬКО в описании (и бывают обфусцированы). Если
-    # по имеющемуся тексту чего-то нет и страницу мы ещё не открывали — открываем.
-    # Отказываем «не 585 / вес не найден» лишь когда страница уже прочитана.
+    if per_gram:
+        # Цена объявления УЖЕ указана за грамм — на вес НЕ делим.
+        if not has_585:
+            if not listing.detailed:
+                return MatchResult(False, "нужна страница", needs_page=True)
+            return MatchResult(False, "не 585 пробы")
+        if listing.price is None:
+            return MatchResult(False, "цена не указана")
+        return _decide(float(listing.price), weight, ambiguous)
+
+    # Обычная цена (за изделие) — нужен вес, чтобы посчитать ₽/г.
     if not has_585 or weight is None:
         if not listing.detailed:
             return MatchResult(False, "нужна страница", needs_page=True)
         reason = "не 585 пробы" if not has_585 else "вес не найден"
         return MatchResult(False, reason, weight_g=weight, ambiguous_weight=ambiguous)
-
     if listing.price is None:
         return MatchResult(False, "цена не указана", weight_g=weight, ambiguous_weight=ambiguous)
+    return _decide(listing.price / weight, weight, ambiguous)
 
-    ppg = listing.price / weight
+
+def _decide(ppg: float, weight: float | None, ambiguous: bool) -> MatchResult:
     threshold = config.MAX_PRICE_PER_GRAM
-    if ppg >= threshold:
-        return MatchResult(
-            False, f"{ppg:,.0f} ₽/г ≥ {threshold}".replace(",", " "),
-            weight_g=weight, price_per_gram=ppg, ambiguous_weight=ambiguous,
-        )
-
-    # Цена подходит. Доставка (если бы требовалась) — регион уже проверен выше.
-    if config.REQUIRE_DELIVERY and listing.has_delivery is False:
-        return MatchResult(
-            False, "нет Авито Доставки",
-            weight_g=weight, price_per_gram=ppg, ambiguous_weight=ambiguous,
-        )
-
+    reason = f"{ppg:,.0f} ₽/г {'<' if ppg < threshold else '≥'} {threshold}".replace(",", " ")
     return MatchResult(
-        True, f"{ppg:,.0f} ₽/г < {threshold}".replace(",", " "),
+        ppg < threshold, reason,
         weight_g=weight, price_per_gram=ppg, ambiguous_weight=ambiguous,
     )
 
