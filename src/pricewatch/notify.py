@@ -43,16 +43,26 @@ def format_message(listing: Listing, result: MatchResult, event: str = "new") ->
 
 
 def send(text: str) -> bool:
-    """Отправить сообщение всем получателям. dry-run считается успехом."""
-    token = config.TELEGRAM_BOT_TOKEN
-    chat_ids = config.TELEGRAM_CHAT_IDS
+    """Отправить совпадение всем получателям. dry-run считается успехом."""
+    return _send_to(text, config.TELEGRAM_CHAT_IDS, html=True)
 
+
+def send_alert(text: str) -> bool:
+    """Служебный алерт о здоровье монитора — только владельцу (первый chat_id)."""
+    ids = config.TELEGRAM_CHAT_IDS[:1] or config.TELEGRAM_CHAT_IDS
+    return _send_to(text, ids, html=False)
+
+
+def _send_to(text: str, chat_ids: list[str], html: bool) -> bool:
+    token = config.TELEGRAM_BOT_TOKEN
     if not token or not chat_ids:
         print("[dry-run: TELEGRAM не настроен, сообщение не отправлено]\n" + text + "\n")
         return True
 
     url = _API.format(token=token)
-    payload_base = {"text": text, "parse_mode": "HTML", "disable_web_page_preview": "false"}
+    payload_base = {"text": text, "disable_web_page_preview": "false"}
+    if html:
+        payload_base["parse_mode"] = "HTML"
     ok_all = True
     for chat_id in chat_ids:
         sent = False

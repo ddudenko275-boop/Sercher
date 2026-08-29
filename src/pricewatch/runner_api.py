@@ -12,7 +12,7 @@ from __future__ import annotations
 import random
 import time
 
-from . import config, notify, store
+from . import config, health, notify, store
 from .avito_api import AvitoApi, convert_search_url
 from .filter import evaluate
 
@@ -34,6 +34,8 @@ def run_once() -> int:
     first_run = store.is_empty(conn)
     pages = config.FIRST_RUN_PAGES if first_run else config.PAGES
     api = AvitoApi()
+    # Проактивно освежить cookies, если протухают (не ждём блокировки в проходе).
+    api.refresh_cookies_if_old()
 
     # Небольшой случайный сдвиг старта — проходы не строго по расписанию.
     time.sleep(random.uniform(*getattr(config, "START_JITTER_SEC", (0, 0))))
@@ -41,6 +43,7 @@ def run_once() -> int:
     regions = _all_regions()
     print(f"Проход: регионов {len(regions)}, страниц/регион {pages}, первый запуск: {first_run}")
     sent = 0
+    collected = 0  # всего собрано объявлений за проход — индикатор «сбор живой»
 
     for name, slug in regions:
         search = config.SEARCH_URL_TEMPLATE.format(region=slug)
@@ -81,12 +84,42 @@ def run_once() -> int:
 
             time.sleep(random.uniform(*config.PAGE_DELAY_SEC))  # «живой» темп между страницами
 
+        collected += total
         print(f"[{name}] объявлений: {total}")
         time.sleep(random.uniform(*config.REGION_DELAY_SEC))  # «живой» темп между регионами
 
     conn.close()
+    _update_health(collected, api)
     print(f"Отправлено уведомлений: {sent}")
     return sent
+
+
+def _update_health(collected: int, api: AvitoApi) -> None:
+    """Обновить здоровье и, если сбор долго пуст, один раз предупредить владельца."""
+    import time as _t
+
+    state = health.load()
+    now = _t.time()
+    state.setdefault("last_ok", now)
+
+    if collected > 0:
+        # сбор живой — снять тревогу, при необходимости сообщить о восстановлении
+        if state.get("alerted"):
+            notify.send_alert("✅ Sercher: сбор данных восстановлен, объявления снова идут.")
+        state["last_ok"] = now
+        state["alerted"] = False
+    else:
+        idle_h = (now - state["last_ok"]) / 3600
+        if now - state["last_ok"] > config.ALERT_AFTER_SEC and not state.get("alerted"):
+            reason = api.degraded_reason or "похоже на бан IP или сбой spfa"
+            notify.send_alert(
+                f"⚠️ Sercher: сбор данных нарушен уже ~{idle_h:.0f} ч.\n"
+                f"Причина: {reason}.\n"
+                f"Авто-восстановление пробуется каждый проход. Проверь баланс spfa и прокси."
+            )
+            state["alerted"] = True
+
+    health.save(state)
 
 
 if __name__ == "__main__":

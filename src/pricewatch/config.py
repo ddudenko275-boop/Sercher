@@ -144,6 +144,22 @@ SPFA_API_KEY = os.getenv("SPFA_API_KEY", "")
 # Прокси одной строкой: http://логин:пароль@host:порт (или socks5://...).
 PROXY = os.getenv("PROXY", "")
 
+# --- Авто-восстановление при бане IP + защита от зависаний ---
+# Ссылка ротации IP мобильного прокси (mobileproxy). Обязательно с &format=json —
+# тогда ответ компактный (без 57КБ HTML). Кладём в .env. Пусто — ротация выключена.
+CHANGEIP_URL = os.getenv("CHANGEIP_URL", "")
+# Cookies живут ~12ч; освежаем ЗАРАНЕЕ по возрасту, не дожидаясь блокировки.
+COOKIE_MAX_AGE_SEC = 8 * 3600
+# Не ротировать IP чаще этого (mobileproxy лимитирует частоту смены IP).
+ROTATE_COOLDOWN_SEC = 900
+# Минимальный баланс spfa (₽), при котором ещё покупаем cookies. Одна покупка ~3 ₽;
+# ниже буфера не ротируем IP (ротация без возможности купить cookies = мёртвая система).
+MIN_SPFA_BALANCE = 6.0
+# Если сбор «пустой» дольше этого — один тревожный алерт владельцу в Telegram.
+ALERT_AFTER_SEC = 2 * 3600
+# Файл состояния здоровья монитора (last_ok, last_rotation, alerted).
+HEALTH_PATH = "data/health.json"
+
 # --- Telegram (создаётся у @BotFather; кладём в .env, а не в код) ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # Получателей может быть несколько — перечисли chat id через запятую в .env:

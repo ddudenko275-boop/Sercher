@@ -19,7 +19,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import requests
 from curl_cffi import requests as creq
 
-from . import config
+from . import config, health
 from .models import Listing
 
 _SPFA = "https://spfa.pro/api"
@@ -43,10 +43,21 @@ def convert_search_url(search_url: str) -> str:
 
     api_url = None
     for attempt in range(4):
-        r = requests.post(f"{_SPFA}/avito-url/", json={"url": search_url}, timeout=25)
+        try:
+            r = requests.post(f"{_SPFA}/avito-url/", json={"url": search_url}, timeout=25)
+        except requests.RequestException:
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            raise
         if r.status_code == 429:  # лимит spfa — ждём и повторяем
             time.sleep(32)
             continue
+        if r.status_code >= 500:  # spfa лёг — не устраиваем шторм ретраев
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            r.raise_for_status()
         r.raise_for_status()
         api_url = (r.json() or {}).get("api_url")
         break
@@ -69,6 +80,9 @@ class AvitoApi:
         self._cookies: dict | None = None
         self._fingerprint: dict = {}
         self._user_agent: str | None = None
+        self._ts: float = 0.0            # когда куплены cookies (для возраста)
+        self._recovered_this_pass = False  # восстановление пробуем раз за проход
+        self.degraded_reason: str | None = None  # причина деградации (для алерта)
         self._load_cookies()
 
     def _load_cookies(self) -> None:
@@ -81,17 +95,41 @@ class AvitoApi:
             self._cookies = d.get("cookies")
             self._fingerprint = d.get("fingerprint") or {}
             self._user_agent = d.get("user_agent")
+            self._ts = float(d.get("ts") or 0.0)
         except Exception:
             pass
 
     def _save_cookies(self) -> None:
+        self._ts = time.time()
         _COOKIES_CACHE.parent.mkdir(parents=True, exist_ok=True)
         _COOKIES_CACHE.write_text(json.dumps({
             "id": self._id,
             "cookies": self._cookies,
             "fingerprint": self._fingerprint,
             "user_agent": self._user_agent,
+            "ts": self._ts,
         }, ensure_ascii=False), "utf-8")
+
+    def cookie_age(self) -> float | None:
+        """Возраст текущих cookies в секундах (None — если их нет)."""
+        if not self._cookies or not self._ts:
+            return None
+        return time.time() - self._ts
+
+    def refresh_cookies_if_old(self) -> bool:
+        """Проактивно освежить cookies, если они старше COOKIE_MAX_AGE_SEC.
+
+        Дешевле и надёжнее, чем ждать блокировки протухших cookies в разгар прохода.
+        """
+        age = self.cookie_age()
+        if age is not None and age > config.COOKIE_MAX_AGE_SEC:
+            try:
+                print(f"[cookies] возраст {age/3600:.1f}ч — проактивно перевыпускаю")
+                self._buy_cookies()
+                return True
+            except Exception as e:
+                print(f"[cookies] проактивный перевыпуск не удался: {e}")
+        return False
 
     # --- cookies через spfa ---
     def _buy_cookies(self) -> None:
@@ -112,20 +150,68 @@ class AvitoApi:
             raise RuntimeError(f"spfa вернул неполные cookies: {data}")
         self._save_cookies()
 
-    def _unblock_or_rebuy(self) -> None:
-        if self._id:
-            try:
-                r = requests.post(
-                    f"{_SPFA}/unblock/",
-                    json={"id": self._id, "api_key": self.api_key, "proxy": self.proxy},
-                    timeout=30,
-                )
-                if r.status_code in (200, 202, 409):
-                    time.sleep(5)
-                    return
-            except requests.RequestException:
-                pass
-        self._buy_cookies()
+    def _balance(self) -> float | None:
+        """Текущий баланс spfa (₽). Дёшев и работает даже когда выдача cookies тупит."""
+        try:
+            r = requests.post(f"{_SPFA}/balance/", json={"api_key": self.api_key}, timeout=20)
+            if r.status_code == 200:
+                return float((r.json() or {}).get("balance"))
+        except Exception:
+            pass
+        return None
+
+    def _rotate_ip(self) -> bool:
+        """Сменить IP мобильного прокси по ссылке ротации (с учётом кулдауна).
+
+        IP-бан Авито лечится ТОЛЬКО сменой IP: spfa /unblock/ IP не меняет.
+        mobileproxy лимитирует частоту смены — держим кулдаун между проходами.
+        """
+        url = getattr(config, "CHANGEIP_URL", "")
+        if not url:
+            return False
+        last_rot = float(health.get("last_rotation", 0) or 0)
+        if time.time() - last_rot < config.ROTATE_COOLDOWN_SEC:
+            print("[recover] ротация IP на кулдауне — пробую только новые cookies")
+            return False
+        try:
+            r = requests.get(url, timeout=30)
+            body = (r.text or "").lower()
+            ok = r.status_code == 200 and ("ok" in body or "success" in body or "new ip" in body)
+            if ok:
+                health.update(last_rotation=time.time())
+                print("[recover] IP прокси сменён")
+                time.sleep(12)  # дать прокси применить новый IP
+                return True
+            print(f"[recover] ротация IP не удалась: HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[recover] ротация IP ошибка: {type(e).__name__}: {e}")
+        return False
+
+    def _recover(self) -> bool:
+        """Авто-восстановление после блока: баланс → смена IP → новые cookies.
+
+        Пробуем максимум один раз за проход (иначе на сбое spfa зациклимся и
+        подвесим проход). Если денег нет или spfa лежит — помечаем деградацию.
+        """
+        if self._recovered_this_pass:
+            return False
+        self._recovered_this_pass = True
+
+        bal = self._balance()
+        if bal is not None and bal < config.MIN_SPFA_BALANCE:
+            self.degraded_reason = f"баланс spfa {bal:.0f}₽ — пополни, cookies не купить"
+            print(f"[recover] {self.degraded_reason}")
+            return False  # без денег ротировать IP нельзя — убьёт рабочие cookies
+
+        self._rotate_ip()  # сменить IP (внутри кулдаун); при неудаче всё равно
+        try:               # пробуем свежие cookies под (возможно новый) IP
+            self._buy_cookies()
+            print("[recover] cookies перевыпущены — продолжаю")
+            return True
+        except Exception as e:
+            self.degraded_reason = f"spfa не отдал cookies: {e}"
+            print(f"[recover] {self.degraded_reason}")
+            return False
 
     def _session(self) -> "creq.Session":
         if not self._cookies:
@@ -147,14 +233,16 @@ class AvitoApi:
     # --- выдача ---
     def fetch_page(self, api_url: str, page: int) -> list[Listing]:
         url = _with_page(api_url, page)
-        for _ in range(3):
+        for _ in range(2):
             s = self._session()
             r = s.get(url, timeout=40)
             if r.status_code == 200:
                 return _items_to_listings(r.json())
             if r.status_code in (403, 429, 439):
-                self._unblock_or_rebuy()
-                time.sleep(3)
+                # блок (обычно бан IP) — авто-восстановление; не вышло → не висим,
+                # пропускаем регион (следующий проход/регион продолжит).
+                if not self._recover():
+                    return []
                 continue
             r.raise_for_status()
         return []
