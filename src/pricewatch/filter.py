@@ -55,7 +55,29 @@ def evaluate(listing: Listing) -> MatchResult:
         return MatchResult(False, _weight_reason(weight), weight_g=weight, ambiguous_weight=ambiguous)
     if listing.price is None:
         return MatchResult(False, "цена не указана", weight_g=weight, ambiguous_weight=ambiguous)
+    # Перекрёстная проверка: если цена_объявления × вес ≈ полной цене из описания,
+    # значит в поле цены указан ₽/ГРАММ (частый случай у лома) — тогда НЕ делим.
+    if _price_is_per_gram_by_math(listing.price, weight, text):
+        return _decide(float(listing.price), weight, ambiguous)
     return _decide(listing.price / weight, weight, ambiguous)
+
+
+def _price_is_per_gram_by_math(price: int | None, weight: float | None, text: str) -> bool:
+    """Похоже ли, что цена объявления — это ₽/грамм, а не полная цена изделия?
+
+    Признак: цена × вес совпадает (±15%) с одной из «полных цен», указанных прямо
+    в описании. Полная цена по определению больше цены за грамм, поэтому суммы,
+    не превышающие саму цену, игнорируем — это защищает обычные объявления.
+    """
+    if not price or not weight:
+        return False
+    implied_full = price * weight
+    for money in extract.parse_money_amounts(text):
+        if money <= price:
+            continue
+        if abs(implied_full - money) <= 0.15 * money:
+            return True
+    return False
 
 
 def _weight_ok(weight: float | None) -> bool:
@@ -74,6 +96,11 @@ def _weight_reason(weight: float | None) -> str:
 
 
 def _decide(ppg: float, weight: float | None, ambiguous: bool) -> MatchResult:
+    # Нереально низкая цена за грамм — это не сделка, а ошибка разбора
+    # (код модели вместо веса и т.п.). Не шлём.
+    if ppg < config.MIN_PLAUSIBLE_PRICE_PER_GRAM:
+        reason = f"{ppg:,.0f} ₽/г — ошибка веса/описания".replace(",", " ")
+        return MatchResult(False, reason, weight_g=weight, price_per_gram=ppg, ambiguous_weight=ambiguous)
     threshold = config.MAX_PRICE_PER_GRAM
     reason = f"{ppg:,.0f} ₽/г {'<' if ppg < threshold else '≥'} {threshold}".replace(",", " ")
     return MatchResult(

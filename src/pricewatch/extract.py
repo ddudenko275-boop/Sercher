@@ -109,3 +109,31 @@ def parse_weight_grams(text: str) -> tuple[float | None, bool]:
 
     ambiguous = len(set(candidates)) > 1
     return candidates[0], ambiguous
+
+
+# «Полная цена изделия» в тексте: 10 000…9 999 999. Ловим сгруппированные
+# («250 000», «250.000») и слитные 5–7-значные. Разделители тысяч: пробел,
+# неразрывный ( ) и узкий неразрывный ( ) пробелы, точка. Телефоны
+# (11 цифр) и проба (585, < 10000) сюда не попадают — вне диапазона длины/значения.
+_MONEY_SEP = "[   .]"
+_MONEY_RE = re.compile(
+    r"(?<![\d.,])(\d{1,3}(?:" + _MONEY_SEP + r"\d{3})+|\d{5,7})(?!\d)"
+)
+
+
+def parse_money_amounts(text: str) -> list[int]:
+    """Все правдоподобные суммы (полные цены) из текста, 10 000…9 999 999 ₽.
+
+    Нужно для перекрёстной проверки: если цена_объявления × вес ≈ одной из этих
+    сумм, значит в цене объявления указан ₽/ГРАММ (а не полная цена изделия).
+    """
+    out: list[int] = []
+    for m in _MONEY_RE.finditer(_normalize(text)):
+        digits = re.sub(_MONEY_SEP, "", m.group(1))
+        try:
+            val = int(digits)
+        except ValueError:
+            continue
+        if 10_000 <= val <= 9_999_999:
+            out.append(val)
+    return out

@@ -18,10 +18,14 @@ from .filter import evaluate
 
 
 def _all_regions() -> list[tuple[str, str]]:
+    """Регионы кольцами (сначала ближние). Внутри кольца порядок можно мешать —
+    так проходы выглядят «живее» и не бьют всегда по одному шаблону."""
     out: list[tuple[str, str]] = []
     for ring in config.REGION_RINGS:
-        for name, slug in ring.items():
-            out.append((name, slug))
+        items = list(ring.items())
+        if getattr(config, "SHUFFLE_WITHIN_RING", False):
+            random.shuffle(items)
+        out.extend(items)
     return out
 
 
@@ -30,6 +34,9 @@ def run_once() -> int:
     first_run = store.is_empty(conn)
     pages = config.FIRST_RUN_PAGES if first_run else config.PAGES
     api = AvitoApi()
+
+    # Небольшой случайный сдвиг старта — проходы не строго по расписанию.
+    time.sleep(random.uniform(*getattr(config, "START_JITTER_SEC", (0, 0))))
 
     regions = _all_regions()
     print(f"Проход: регионов {len(regions)}, страниц/регион {pages}, первый запуск: {first_run}")
@@ -72,10 +79,10 @@ def run_once() -> int:
                     sent += 1
                     print(f"  ✅ {result.reason} — {listing.title}")
 
-            time.sleep(random.uniform(0.5, 1.5))  # спокойный темп между страницами
+            time.sleep(random.uniform(*config.PAGE_DELAY_SEC))  # «живой» темп между страницами
 
         print(f"[{name}] объявлений: {total}")
-        time.sleep(random.uniform(1.0, 2.5))  # темп между регионами
+        time.sleep(random.uniform(*config.REGION_DELAY_SEC))  # «живой» темп между регионами
 
     conn.close()
     print(f"Отправлено уведомлений: {sent}")
