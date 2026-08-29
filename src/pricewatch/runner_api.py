@@ -32,7 +32,11 @@ def _all_regions() -> list[tuple[str, str]]:
 def run_once() -> int:
     conn = store.connect(config.DB_PATH)
     first_run = store.is_empty(conn)
-    pages = config.FIRST_RUN_PAGES if first_run else config.PAGES
+    if getattr(config, "DEEP_SWEEP", False):
+        pages = config.MAX_PAGES_DEEP  # разовый глубокий прочёс всего рынка
+        print("РЕЖИМ: глубокий прочёс — все страницы, круг за кругом с круга 0")
+    else:
+        pages = config.FIRST_RUN_PAGES if first_run else config.PAGES
     api = AvitoApi()
     # Проактивно освежить cookies, если протухают (не ждём блокировки в проходе).
     api.refresh_cookies_if_old()

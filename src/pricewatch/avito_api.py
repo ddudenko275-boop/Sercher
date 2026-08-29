@@ -81,7 +81,8 @@ class AvitoApi:
         self._fingerprint: dict = {}
         self._user_agent: str | None = None
         self._ts: float = 0.0            # когда куплены cookies (для возраста)
-        self._recovered_this_pass = False  # восстановление пробуем раз за проход
+        self._last_recover: float = 0.0  # время последней попытки восстановления
+        self._recover_count = 0          # сколько раз восстанавливались за процесс
         self.degraded_reason: str | None = None  # причина деградации (для алерта)
         self._load_cookies()
 
@@ -190,12 +191,18 @@ class AvitoApi:
     def _recover(self) -> bool:
         """Авто-восстановление после блока: баланс → смена IP → новые cookies.
 
-        Пробуем максимум один раз за проход (иначе на сбое spfa зациклимся и
-        подвесим проход). Если денег нет или spfa лежит — помечаем деградацию.
+        Пробуем повторяемо (важно для долгого прочёса), но не чаще, чем раз в
+        RECOVER_MIN_INTERVAL_SEC, и не больше MAX_RECOVERIES_PER_RUN за процесс.
+        Если денег нет или IP сменить нельзя — помечаем деградацию, cookies зря
+        НЕ покупаем.
         """
-        if self._recovered_this_pass:
+        now = time.time()
+        if now - self._last_recover < config.RECOVER_MIN_INTERVAL_SEC:
+            return False  # слишком часто — этот регион пропустим, восстановимся позже
+        self._last_recover = now
+        if self._recover_count >= config.MAX_RECOVERIES_PER_RUN:
+            self.degraded_reason = "исчерпан лимит авто-восстановлений за проход"
             return False
-        self._recovered_this_pass = True
 
         bal = self._balance()
         if bal is not None and bal < config.MIN_SPFA_BALANCE:
@@ -203,10 +210,16 @@ class AvitoApi:
             print(f"[recover] {self.degraded_reason}")
             return False  # без денег ротировать IP нельзя — убьёт рабочие cookies
 
-        self._rotate_ip()  # сменить IP (внутри кулдаун); при неудаче всё равно
-        try:               # пробуем свежие cookies под (возможно новый) IP
+        # Бан Авито — это бан IP. Новые cookies спасают ТОЛЬКО вместе со сменой IP;
+        # покупать их на том же (забаненном) IP — впустую тратить деньги. Поэтому
+        # rebuy делаем лишь после успешной ротации; иначе ждём окна ротации.
+        if not self._rotate_ip():
+            self.degraded_reason = "IP сменить пока нельзя (кулдаун ротации) — жду окна"
+            return False
+        try:
             self._buy_cookies()
-            print("[recover] cookies перевыпущены — продолжаю")
+            self._recover_count += 1
+            print("[recover] IP сменён + cookies перевыпущены — продолжаю")
             return True
         except Exception as e:
             self.degraded_reason = f"spfa не отдал cookies: {e}"
