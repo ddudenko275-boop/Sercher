@@ -32,11 +32,15 @@ def _all_regions() -> list[tuple[str, str]]:
 def run_once() -> int:
     conn = store.connect(config.DB_PATH)
     first_run = store.is_empty(conn)
-    if getattr(config, "DEEP_SWEEP", False):
+    deep = getattr(config, "DEEP_SWEEP", False)
+    if deep:
         pages = config.MAX_PAGES_DEEP  # разовый глубокий прочёс всего рынка
         print("РЕЖИМ: глубокий прочёс — все страницы, круг за кругом с круга 0")
     else:
         pages = config.FIRST_RUN_PAGES if first_run else config.PAGES
+    # Для глубокого прочёса темп быстрее (разовый); для обычных проходов — спокойный.
+    page_delay = config.DEEP_PAGE_DELAY_SEC if deep else config.PAGE_DELAY_SEC
+    region_delay = config.DEEP_REGION_DELAY_SEC if deep else config.REGION_DELAY_SEC
     api = AvitoApi()
     # Проактивно освежить cookies, если протухают (не ждём блокировки в проходе).
     api.refresh_cookies_if_old()
@@ -86,11 +90,11 @@ def run_once() -> int:
                     sent += 1
                     print(f"  ✅ {result.reason} — {listing.title}")
 
-            time.sleep(random.uniform(*config.PAGE_DELAY_SEC))  # «живой» темп между страницами
+            time.sleep(random.uniform(*page_delay))  # темп между страницами
 
         collected += total
         print(f"[{name}] объявлений: {total}")
-        time.sleep(random.uniform(*config.REGION_DELAY_SEC))  # «живой» темп между регионами
+        time.sleep(random.uniform(*region_delay))  # темп между регионами
 
     conn.close()
     _update_health(collected, api)
