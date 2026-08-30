@@ -204,24 +204,14 @@ class AvitoApi:
         return None
 
     def _rotate_ip(self) -> bool:
-        """Сменить IP мобильного прокси по ссылке ротации (с учётом кулдауна).
-
-        IP-бан Авито лечится ТОЛЬКО сменой IP: spfa /unblock/ IP не меняет.
-        mobileproxy лимитирует частоту смены — держим кулдаун между проходами.
-        """
+        """Дёрнуть смену IP по ссылке ротации. Гейт по кулдауну — на стороне recover()."""
         url = getattr(config, "CHANGEIP_URL", "")
         if not url:
-            return False
-        last_rot = float(health.get("last_rotation", 0) or 0)
-        if time.time() - last_rot < config.ROTATE_COOLDOWN_SEC:
-            log("[recover] ротация IP на кулдауне — пропускаю")
             return False
         try:
             r = requests.get(url, timeout=30)
             body = (r.text or "").lower()
-            ok = r.status_code == 200 and ("ok" in body or "success" in body or "new ip" in body)
-            if ok:
-                health.update(last_rotation=time.time())
+            if r.status_code == 200 and ("ok" in body or "success" in body or "new ip" in body):
                 log("[recover] IP прокси сменён по ссылке")
                 time.sleep(12)  # дать прокси применить новый IP
                 return True
@@ -231,15 +221,15 @@ class AvitoApi:
         return False
 
     def recover(self) -> bool:
-        """Восстановление после стойкого блока. ДЁШЕВО и по доказательствам:
+        """Восстановление после стойкого бана. ПОКУПКА cookies — ТОЛЬКО НА НОВЫЙ IP.
 
-        1. дневной бюджет покупок cookies (жёсткий потолок трат);
-        2. баланс spfa;
-        3. exit-IP: если он ИЗМЕНИЛСЯ сам — прокси сменил IP, cookies протухли не
-           из-за бана → просто покупаем новые (changeip НЕ дёргаем). Если IP тот же —
-           это бан Авито на нашем IP → меняем IP (по кулдауну), потом cookies.
-
-        Вызывается раннером ТОЛЬКО после нескольких блоков подряд (не на первый чих).
+        Новые cookies на том же живом IP не лечат бан (у Авито бан IP-шный), поэтому
+        весь контроль трат — в ПОЛИТИКЕ РОТАЦИИ, адаптивной по времени жизни IP:
+          • IP умер мгновенно (<60с) — плохая раздача пула, переротация по базе, без штрафа;
+          • пожил и умер (мин) — горит от НАШЕЙ нагрузки → удваиваем кулдаун (бэкоф),
+            не бьёмся в ту же стену (иначе утренние 35 покупок);
+          • прожил >2ч — нагрузка ок → сбрасываем кулдаун к базе.
+        Дневной потолок покупок — теперь предохранитель от бага, а не регулятор.
         """
         now = time.time()
         if now - self._last_recover < config.RECOVER_MIN_INTERVAL_SEC:
@@ -249,32 +239,62 @@ class AvitoApi:
             self.degraded_reason = "исчерпан лимит авто-восстановлений за проход"
             return False
 
+        st = health.load()
+        ip_born = float(st.get("last_rotation", 0) or 0)
+        cooldown = float(st.get("rotate_cooldown", config.ROTATE_COOLDOWN_SEC)
+                         or config.ROTATE_COOLDOWN_SEC)
+        lifetime = (now - ip_born) if ip_born else 1e9
+
+        # Адаптация кулдауна по времени жизни ПРОШЛОГО IP.
+        if lifetime > config.ROTATE_LIFETIME_RESET:
+            cooldown = config.ROTATE_COOLDOWN_SEC            # жил долго — база
+        elif lifetime >= config.ROTATE_INSTANT_DEATH:
+            cooldown = min(cooldown * 2, config.ROTATE_COOLDOWN_MAX)  # горит от нагрузки — бэкоф
+            log(f"[recover] IP прожил {lifetime / 60:.0f} мин — бэкоф ротации до {cooldown / 60:.0f} мин")
+        # lifetime < INSTANT_DEATH: плохой IP из пула — кулдаун не меняем
+
+        def _persist():
+            st["rotate_cooldown"] = cooldown
+            health.save(st)
+
+        # ПРЕДОХРАНИТЕЛЬ (не регулятор): при верной политике недостижим; сработал = баг.
         if self._purchases_today() >= config.MAX_REBUYS_PER_DAY:
-            self.degraded_reason = (
-                f"дневной лимит покупок cookies исчерпан "
-                f"({config.MAX_REBUYS_PER_DAY}/сутки) — защита кошелька")
+            self.degraded_reason = (f"ПРЕДОХРАНИТЕЛЬ: {config.MAX_REBUYS_PER_DAY} покупок/сутки — "
+                                    f"значит баг в логике, а не нормальный режим")
             log(f"[recover] {self.degraded_reason}")
+            _persist()
             return False
 
         bal = self._balance()
         if bal is not None and bal < config.MIN_SPFA_BALANCE:
             self.degraded_reason = f"баланс spfa {bal:.0f}₽ — пополни, cookies не купить"
             log(f"[recover] {self.degraded_reason}")
+            _persist()
             return False
 
         cur_ip = self._exit_ip()
         if cur_ip and self._exit_ip_saved and cur_ip != self._exit_ip_saved:
-            # прокси сам сменил IP — cookies под старый IP уже не годятся; changeip НЕ нужен
-            log(f"[recover] прокси сменил IP сам ({self._exit_ip_saved}→{cur_ip}) — беру только cookies")
+            # прокси сам сменил IP — законная покупка «после смены IP», changeip НЕ нужен
+            log(f"[recover] прокси сменил IP сам ({self._exit_ip_saved}→{cur_ip}) — беру cookies")
         else:
-            # тот же IP забанен Авито — есть смысл сменить IP (по кулдауну)
-            if not self._rotate_ip():
-                self.degraded_reason = "IP сменить пока нельзя (кулдаун) — жду, лишнего не трачу"
+            # тот же IP забанен → нужна ротация, но по кулдауну (мгновенную смерть гейтим базой)
+            gate = config.ROTATE_COOLDOWN_SEC if lifetime < config.ROTATE_INSTANT_DEATH else cooldown
+            if lifetime < gate:
+                self.degraded_reason = f"ротация через ~{(gate - lifetime) / 60:.0f} мин (бэкоф) — денег не жгу"
+                log(f"[recover] жду окна ротации ещё ~{gate - lifetime:.0f}с (IP горят от темпа)")
+                _persist()
                 return False
+            if not self._rotate_ip():
+                _persist()
+                return False
+
+        # IP новый (наш changeip или самопроизвольный) → фиксируем «рождение» и покупаем cookies
+        st["last_rotation"] = now
+        _persist()
         try:
             self._buy_cookies()
             self._recover_count += 1
-            log("[recover] cookies перевыпущены — продолжаю")
+            log("[recover] cookies перевыпущены под новый IP — продолжаю")
             return True
         except Exception as e:
             self.degraded_reason = f"spfa не отдал cookies: {e}"
@@ -301,22 +321,21 @@ class AvitoApi:
     # --- выдача ---
     def fetch_page(self, api_url: str, page: int) -> list[Listing]:
         url = _with_page(api_url, page)
-        for attempt in range(2):
+        # Блок (403/429/439) при листании — это чаще РЕЙТ-ЛИМИТ Авито («притормози»),
+        # а не бан насмерть и не протухшие cookies. Он проходит сам за десятки секунд.
+        # Поэтому сначала ЖДЁМ и повторяем ТЕМИ ЖЕ cookies (0 ₽); эскалируем в
+        # AvitoBlocked (→ платное восстановление) только если блок пережил ожидание.
+        for wait in (0, 20, 45, 90):
+            if wait:
+                time.sleep(wait)
             s = self._session()
             r = s.get(url, timeout=40)
             if r.status_code == 200:
                 return _items_to_listings(r.json())
             if r.status_code in (403, 429, 439):
-                # Блок. Часто это рейт-лимит Авито по объёму, а не протухшие cookies —
-                # тогда лечит ПАУЗА (перевыпуск бесполезен, IP тот же). Сначала ждём и
-                # повторяем тем же сеансом; если и вторая попытка блок — сигналим
-                # раннеру (он копит блоки и решает, тратиться ли на восстановление).
-                if attempt == 0:
-                    time.sleep(8)
-                    continue
-                raise AvitoBlocked(f"HTTP {r.status_code}")
+                continue
             r.raise_for_status()
-        return []
+        raise AvitoBlocked("блок пережил ожидание (нужно восстановление)")
 
 
 def with_price(api_url: str, pmin: int | None, pmax: int | None) -> str:
