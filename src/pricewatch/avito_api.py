@@ -259,10 +259,12 @@ class AvitoApi:
             st["rotate_cooldown"] = cooldown
             health.save(st)
 
-        # ПРЕДОХРАНИТЕЛЬ (не регулятор): при верной политике недостижим; сработал = баг.
-        if self._purchases_today() >= config.MAX_REBUYS_PER_DAY:
-            self.degraded_reason = (f"ПРЕДОХРАНИТЕЛЬ: {config.MAX_REBUYS_PER_DAY} покупок/сутки — "
-                                    f"значит баг в логике, а не нормальный режим")
+        # ПРЕДОХРАНИТЕЛЬ. В обычном мониторе — от бага; в прочёсе — осознанный потолок трат.
+        budget = (config.DEEP_MAX_REBUYS_PER_DAY if getattr(config, "DEEP_SWEEP", False)
+                  else config.MAX_REBUYS_PER_DAY)
+        if self._purchases_today() >= budget:
+            self.degraded_reason = (f"ПРЕДОХРАНИТЕЛЬ: {budget} покупок cookies/сутки — "
+                                    f"дальше не трачу (в прочёсе это ~{budget * 3} ₽)")
             log(f"[recover] {self.degraded_reason}")
             _persist()
             return False
