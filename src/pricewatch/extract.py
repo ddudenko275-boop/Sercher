@@ -131,9 +131,24 @@ _BUYER_RE = re.compile(
 )
 
 
+# Много РАЗНЫХ проб в одном объявлении (585/750/850/900/999...) — прайс скупщика:
+# продавец продаёт одно изделие одной пробы, а скупщик перечисляет все.
+_ANY_PROBA_RE = re.compile(
+    r"(?<!\d)(375|500|583|585|750|800|830|850|875|900|916|958|999)(?!\d)")
+
+
+def _lists_many_probas(t: str) -> bool:
+    return len(set(_ANY_PROBA_RE.findall(t))) >= 3
+
+
 def is_buyer(text: str) -> bool:
-    """Это объявление СКУПЩИКА (покупает золото), а не продавца → исключаем."""
-    return bool(_BUYER_RE.search(_normalize(text)))
+    """Это объявление СКУПЩИКА (покупает золото), а не продавца → исключаем.
+
+    Два признака: (1) слова скупки (выкуп/куплю/принимаем...); (2) перечислено ≥3
+    разных проб — прайс-лист скупщика, а не одно изделие продавца.
+    """
+    t = _normalize(text)
+    return bool(_BUYER_RE.search(t)) or _lists_many_probas(t)
 
 
 def parse_weight_grams(text: str) -> tuple[float | None, bool]:
