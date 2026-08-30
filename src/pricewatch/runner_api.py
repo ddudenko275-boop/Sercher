@@ -21,11 +21,13 @@ from .filter import evaluate
 from .logutil import log
 
 
-def _all_regions() -> list[tuple[str, str]]:
-    """Регионы кольцами (сначала ближние). Внутри кольца порядок можно мешать —
-    так проходы выглядят «живее» и не бьют всегда по одному шаблону."""
+def _all_regions(n_rings: int | None = None) -> list[tuple[str, str]]:
+    """Регионы кольцами (сначала ближние). n_rings ограничивает первыми N кругами
+    (например 2 = круги 0 и 1). Внутри кольца порядок можно мешать — так проходы
+    выглядят «живее» и не бьют всегда по одному шаблону."""
+    rings = config.REGION_RINGS if n_rings is None else config.REGION_RINGS[:n_rings]
     out: list[tuple[str, str]] = []
-    for ring in config.REGION_RINGS:
+    for ring in rings:
         items = list(ring.items())
         if getattr(config, "SHUFFLE_WITHIN_RING", False):
             random.shuffle(items)
@@ -86,15 +88,10 @@ def run_once() -> int:
     api.refresh_cookies_if_old()  # не ждём блокировки протухших cookies в проходе
     time.sleep(random.uniform(*getattr(config, "START_JITTER_SEC", (0, 0))))
 
-    regions = _all_regions()
-    # Ограничить прочёс первыми N кругами: PRICEWATCH_RINGS=2 → круги 0 и 1.
-    # (PRICEWATCH_RING0=1 — устаревший синоним «только круг 0».)
+    # Ограничить первыми N кругами: PRICEWATCH_RINGS=2 → круги 0 и 1 (и в прочёсе,
+    # и в обычном мониторе). Пусто — все круги.
     rings_env = os.getenv("PRICEWATCH_RINGS")
-    if deep and rings_env:
-        n = max(1, int(rings_env))
-        regions = [it for ring in config.REGION_RINGS[:n] for it in ring.items()]
-    elif deep and os.getenv("PRICEWATCH_RING0"):
-        regions = list(config.REGION_RINGS[0].items())
+    regions = _all_regions(int(rings_env) if rings_env else None)
     progress = _load_progress() if deep else {}
     if deep:
         log(f"РЕЖИМ: глубокий прочёс с ценовыми полосами — {len(regions)} регионов "
