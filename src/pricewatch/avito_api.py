@@ -20,11 +20,16 @@ import requests
 from curl_cffi import requests as creq
 
 from . import config, health
+from .logutil import log
 from .models import Listing
 
 _SPFA = "https://spfa.pro/api"
 _URL_CACHE = Path("data/api_urls.json")
 _COOKIES_CACHE = Path("data/cookies.json")
+
+
+class AvitoBlocked(Exception):
+    """Авито вернул блокировку (403/429/439) — регион заблокирован."""
 
 
 def convert_search_url(search_url: str) -> str:
@@ -81,6 +86,7 @@ class AvitoApi:
         self._fingerprint: dict = {}
         self._user_agent: str | None = None
         self._ts: float = 0.0            # когда куплены cookies (для возраста)
+        self._exit_ip_saved: str | None = None  # exit-IP прокси на момент покупки cookies
         self._last_recover: float = 0.0  # время последней попытки восстановления
         self._recover_count = 0          # сколько раз восстанавливались за процесс
         self.degraded_reason: str | None = None  # причина деградации (для алерта)
@@ -97,6 +103,7 @@ class AvitoApi:
             self._fingerprint = d.get("fingerprint") or {}
             self._user_agent = d.get("user_agent")
             self._ts = float(d.get("ts") or 0.0)
+            self._exit_ip_saved = d.get("exit_ip")
         except Exception:
             pass
 
@@ -109,6 +116,7 @@ class AvitoApi:
             "fingerprint": self._fingerprint,
             "user_agent": self._user_agent,
             "ts": self._ts,
+            "exit_ip": self._exit_ip_saved,
         }, ensure_ascii=False), "utf-8")
 
     def cookie_age(self) -> float | None:
@@ -125,11 +133,11 @@ class AvitoApi:
         age = self.cookie_age()
         if age is not None and age > config.COOKIE_MAX_AGE_SEC:
             try:
-                print(f"[cookies] возраст {age/3600:.1f}ч — проактивно перевыпускаю")
+                log(f"[cookies] возраст {age/3600:.1f}ч — проактивно перевыпускаю (до протухания 12ч)")
                 self._buy_cookies()
                 return True
             except Exception as e:
-                print(f"[cookies] проактивный перевыпуск не удался: {e}")
+                log(f"[cookies] проактивный перевыпуск не удался: {e}")
         return False
 
     # --- cookies через spfa ---
@@ -149,7 +157,41 @@ class AvitoApi:
         ).get("user-agent")
         if not (self._cookies and self._fingerprint.get("impersonate")):
             raise RuntimeError(f"spfa вернул неполные cookies: {data}")
+        self._exit_ip_saved = self._exit_ip()  # запомнить, под каким IP взяты cookies
         self._save_cookies()
+        self._count_purchase()
+
+    def _exit_ip(self) -> str | None:
+        """Текущий внешний IP прокси (через ipify). Доказательство: сам ли прокси
+        сменил IP (тогда cookies протухли не из-за бана) или IP тот же (бан Авито)."""
+        if not self.proxy:
+            return None
+        proxy_url = self.proxy if "://" in self.proxy else f"http://{self.proxy}"
+        try:
+            r = requests.get("https://api.ipify.org",
+                             proxies={"http": proxy_url, "https": proxy_url}, timeout=15)
+            if r.status_code == 200:
+                return r.text.strip()
+        except Exception:
+            pass
+        return None
+
+    def _purchases_today(self) -> int:
+        from datetime import date
+        st = health.load()
+        if st.get("rebuy_date") != date.today().isoformat():
+            return 0
+        return int(st.get("rebuy_count", 0))
+
+    def _count_purchase(self) -> None:
+        from datetime import date
+        st = health.load()
+        today = date.today().isoformat()
+        if st.get("rebuy_date") != today:
+            st["rebuy_date"] = today
+            st["rebuy_count"] = 0
+        st["rebuy_count"] = int(st.get("rebuy_count", 0)) + 1
+        health.save(st)
 
     def _balance(self) -> float | None:
         """Текущий баланс spfa (₽). Дёшев и работает даже когда выдача cookies тупит."""
@@ -172,7 +214,7 @@ class AvitoApi:
             return False
         last_rot = float(health.get("last_rotation", 0) or 0)
         if time.time() - last_rot < config.ROTATE_COOLDOWN_SEC:
-            print("[recover] ротация IP на кулдауне — пробую только новые cookies")
+            log("[recover] ротация IP на кулдауне — пропускаю")
             return False
         try:
             r = requests.get(url, timeout=30)
@@ -180,50 +222,63 @@ class AvitoApi:
             ok = r.status_code == 200 and ("ok" in body or "success" in body or "new ip" in body)
             if ok:
                 health.update(last_rotation=time.time())
-                print("[recover] IP прокси сменён")
+                log("[recover] IP прокси сменён по ссылке")
                 time.sleep(12)  # дать прокси применить новый IP
                 return True
-            print(f"[recover] ротация IP не удалась: HTTP {r.status_code}")
+            log(f"[recover] ротация IP не удалась: HTTP {r.status_code}")
         except Exception as e:
-            print(f"[recover] ротация IP ошибка: {type(e).__name__}: {e}")
+            log(f"[recover] ротация IP ошибка: {type(e).__name__}: {e}")
         return False
 
-    def _recover(self) -> bool:
-        """Авто-восстановление после блока: баланс → смена IP → новые cookies.
+    def recover(self) -> bool:
+        """Восстановление после стойкого блока. ДЁШЕВО и по доказательствам:
 
-        Пробуем повторяемо (важно для долгого прочёса), но не чаще, чем раз в
-        RECOVER_MIN_INTERVAL_SEC, и не больше MAX_RECOVERIES_PER_RUN за процесс.
-        Если денег нет или IP сменить нельзя — помечаем деградацию, cookies зря
-        НЕ покупаем.
+        1. дневной бюджет покупок cookies (жёсткий потолок трат);
+        2. баланс spfa;
+        3. exit-IP: если он ИЗМЕНИЛСЯ сам — прокси сменил IP, cookies протухли не
+           из-за бана → просто покупаем новые (changeip НЕ дёргаем). Если IP тот же —
+           это бан Авито на нашем IP → меняем IP (по кулдауну), потом cookies.
+
+        Вызывается раннером ТОЛЬКО после нескольких блоков подряд (не на первый чих).
         """
         now = time.time()
         if now - self._last_recover < config.RECOVER_MIN_INTERVAL_SEC:
-            return False  # слишком часто — этот регион пропустим, восстановимся позже
+            return False
         self._last_recover = now
         if self._recover_count >= config.MAX_RECOVERIES_PER_RUN:
             self.degraded_reason = "исчерпан лимит авто-восстановлений за проход"
             return False
 
+        if self._purchases_today() >= config.MAX_REBUYS_PER_DAY:
+            self.degraded_reason = (
+                f"дневной лимит покупок cookies исчерпан "
+                f"({config.MAX_REBUYS_PER_DAY}/сутки) — защита кошелька")
+            log(f"[recover] {self.degraded_reason}")
+            return False
+
         bal = self._balance()
         if bal is not None and bal < config.MIN_SPFA_BALANCE:
             self.degraded_reason = f"баланс spfa {bal:.0f}₽ — пополни, cookies не купить"
-            print(f"[recover] {self.degraded_reason}")
-            return False  # без денег ротировать IP нельзя — убьёт рабочие cookies
-
-        # Бан Авито — это бан IP. Новые cookies спасают ТОЛЬКО вместе со сменой IP;
-        # покупать их на том же (забаненном) IP — впустую тратить деньги. Поэтому
-        # rebuy делаем лишь после успешной ротации; иначе ждём окна ротации.
-        if not self._rotate_ip():
-            self.degraded_reason = "IP сменить пока нельзя (кулдаун ротации) — жду окна"
+            log(f"[recover] {self.degraded_reason}")
             return False
+
+        cur_ip = self._exit_ip()
+        if cur_ip and self._exit_ip_saved and cur_ip != self._exit_ip_saved:
+            # прокси сам сменил IP — cookies под старый IP уже не годятся; changeip НЕ нужен
+            log(f"[recover] прокси сменил IP сам ({self._exit_ip_saved}→{cur_ip}) — беру только cookies")
+        else:
+            # тот же IP забанен Авито — есть смысл сменить IP (по кулдауну)
+            if not self._rotate_ip():
+                self.degraded_reason = "IP сменить пока нельзя (кулдаун) — жду, лишнего не трачу"
+                return False
         try:
             self._buy_cookies()
             self._recover_count += 1
-            print("[recover] IP сменён + cookies перевыпущены — продолжаю")
+            log("[recover] cookies перевыпущены — продолжаю")
             return True
         except Exception as e:
             self.degraded_reason = f"spfa не отдал cookies: {e}"
-            print(f"[recover] {self.degraded_reason}")
+            log(f"[recover] {self.degraded_reason}")
             return False
 
     def _session(self) -> "creq.Session":
@@ -246,17 +301,20 @@ class AvitoApi:
     # --- выдача ---
     def fetch_page(self, api_url: str, page: int) -> list[Listing]:
         url = _with_page(api_url, page)
-        for _ in range(2):
+        for attempt in range(2):
             s = self._session()
             r = s.get(url, timeout=40)
             if r.status_code == 200:
                 return _items_to_listings(r.json())
             if r.status_code in (403, 429, 439):
-                # блок (обычно бан IP) — авто-восстановление; не вышло → не висим,
-                # пропускаем регион (следующий проход/регион продолжит).
-                if not self._recover():
-                    return []
-                continue
+                # Блок. Часто это рейт-лимит Авито по объёму, а не протухшие cookies —
+                # тогда лечит ПАУЗА (перевыпуск бесполезен, IP тот же). Сначала ждём и
+                # повторяем тем же сеансом; если и вторая попытка блок — сигналим
+                # раннеру (он копит блоки и решает, тратиться ли на восстановление).
+                if attempt == 0:
+                    time.sleep(8)
+                    continue
+                raise AvitoBlocked(f"HTTP {r.status_code}")
             r.raise_for_status()
         return []
 
