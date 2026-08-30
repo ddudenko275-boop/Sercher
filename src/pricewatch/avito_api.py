@@ -89,6 +89,7 @@ class AvitoApi:
         self._exit_ip_saved: str | None = None  # exit-IP прокси на момент покупки cookies
         self._last_recover: float = 0.0  # время последней попытки восстановления
         self._recover_count = 0          # сколько раз восстанавливались за процесс
+        self._rotations_since_success = 0  # смен IP подряд без успешного fetch (детект мёртвых cookies)
         self.degraded_reason: str | None = None  # причина деградации (для алерта)
         self._load_cookies()
 
@@ -247,10 +248,13 @@ class AvitoApi:
             return False
         st["last_rotation"] = now
         health.save(st)
+        self._rotations_since_success += 1
 
-        # 2) Cookies покупаем ТОЛЬКО если протухли/их нет — НЕ при каждой ротации.
+        # 2) Cookies покупаем если протухли/их нет ЛИБО если N смен IP подряд не помогли
+        # (тогда сгорели сами cookies/сессия, а не IP — смена IP уже бесполезна).
         age = self.cookie_age()
-        need_cookies = (not self._cookies) or (age is not None and age > config.COOKIE_MAX_AGE_SEC)
+        cookies_dead = self._rotations_since_success >= config.FORCE_REBUY_AFTER_ROTATIONS
+        need_cookies = (not self._cookies) or (age is not None and age > config.COOKIE_MAX_AGE_SEC) or cookies_dead
         if need_cookies:
             budget = (config.DEEP_MAX_REBUYS_PER_DAY if getattr(config, "DEEP_SWEEP", False)
                       else config.MAX_REBUYS_PER_DAY)
@@ -265,7 +269,9 @@ class AvitoApi:
                 return False
             try:
                 self._buy_cookies()
-                log("[recover] IP сменён + cookies обновлены (протухли) — продолжаю")
+                self._rotations_since_success = 0
+                why = "сгорели" if cookies_dead else "протухли"
+                log(f"[recover] IP сменён + cookies куплены заново ({why}) — продолжаю")
             except Exception as e:
                 self.degraded_reason = f"spfa не отдал cookies: {e}"
                 log(f"[recover] {self.degraded_reason}")
@@ -306,6 +312,7 @@ class AvitoApi:
         for attempt in range(4):
             r = self._session().get(url, timeout=40)
             if r.status_code == 200:
+                self._rotations_since_success = 0  # fetch удался — cookies живы
                 return _items_to_listings(r.json())
             if r.status_code == 429:
                 if si < len(soft):
