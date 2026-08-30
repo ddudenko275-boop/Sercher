@@ -87,8 +87,13 @@ def run_once() -> int:
     time.sleep(random.uniform(*getattr(config, "START_JITTER_SEC", (0, 0))))
 
     regions = _all_regions()
-    # Фокус на круге 0 (PRICEWATCH_RING0=1) — эффективный первый глубокий анализ.
-    if deep and os.getenv("PRICEWATCH_RING0"):
+    # Ограничить прочёс первыми N кругами: PRICEWATCH_RINGS=2 → круги 0 и 1.
+    # (PRICEWATCH_RING0=1 — устаревший синоним «только круг 0».)
+    rings_env = os.getenv("PRICEWATCH_RINGS")
+    if deep and rings_env:
+        n = max(1, int(rings_env))
+        regions = [it for ring in config.REGION_RINGS[:n] for it in ring.items()]
+    elif deep and os.getenv("PRICEWATCH_RING0"):
         regions = list(config.REGION_RINGS[0].items())
     progress = _load_progress() if deep else {}
     if deep:
