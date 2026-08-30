@@ -40,21 +40,35 @@ def _band_label(band) -> str:
     return f" {lo // 1000}k-{'∞' if hi is None else str(hi // 1000) + 'k'}"
 
 
-def _load_progress() -> set[str]:
+def _load_progress() -> dict:
+    """{ключ_полосы: "done" | номер_последней_пройденной_страницы} — постраничный чекпоинт."""
     p = Path(config.SWEEP_PROGRESS_PATH)
     if p.exists():
         try:
-            return set(json.loads(p.read_text("utf-8")))
+            return dict(json.loads(p.read_text("utf-8")))
         except Exception:
-            return set()
-    return set()
+            return {}
+    return {}
 
 
-def _mark_progress(done: set[str], key: str) -> None:
-    done.add(key)
+def _save_progress(progress: dict) -> None:
     p = Path(config.SWEEP_PROGRESS_PATH)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(sorted(done), ensure_ascii=False), "utf-8")
+    p.write_text(json.dumps(progress, ensure_ascii=False), "utf-8")
+
+
+def _recover_blocking(api: AvitoApi, label: str) -> bool:
+    """Восстановиться, НЕ бросая полосу: ждём окно ротации (кулдаун) и меняем IP.
+    False только если восстановление реально невозможно (баланс/предохранитель)."""
+    for _ in range(15):  # до ~16 мин ожидания окна ротации
+        if api.recover():
+            return True
+        r = api.degraded_reason or ""
+        if "баланс" in r or "ПРЕДОХРАНИТЕЛЬ" in r:
+            log(f"[{label}] восстановление невозможно: {r}")
+            return False
+        time.sleep(65)  # кулдаун ротации ещё не вышел — подождём и повторим
+    return False
 
 
 def run_once() -> int:
@@ -76,18 +90,21 @@ def run_once() -> int:
     # Фокус на круге 0 (PRICEWATCH_RING0=1) — эффективный первый глубокий анализ.
     if deep and os.getenv("PRICEWATCH_RING0"):
         regions = list(config.REGION_RINGS[0].items())
-    done = _load_progress() if deep else set()
+    progress = _load_progress() if deep else {}
     if deep:
         log(f"РЕЖИМ: глубокий прочёс с ценовыми полосами — {len(regions)} регионов "
-            f"× {len(bands)} полос, до {pages} стр/полоса (уже сделано: {len(done)})")
+            f"× {len(bands)} полос, до {pages} стр/полоса (полос готово: "
+            f"{sum(1 for v in progress.values() if v == 'done')})")
     else:
         log(f"Проход: регионов {len(regions)}, страниц/регион {pages}, "
             f"первый запуск: {first_run}")
 
     sent = collected = nonzero_regions = 0
-    consecutive_blocks = 0  # блоков подряд — копим до порога, потом восстанавливаемся
+    stopped = False  # восстановление стало невозможным (баланс/предохранитель) — прерываем
 
     for name, slug in regions:
+        if stopped:
+            break
         try:
             base_url = convert_search_url(config.SEARCH_URL_TEMPLATE.format(region=slug))
         except Exception as e:
@@ -98,29 +115,36 @@ def run_once() -> int:
         for band in bands:
             band_pages = band[2] if band else pages  # своя глубина у каждой полосы
             key = f"{slug}|{band[0]}|{band[1]}" if band else slug
-            if deep and key in done:
+            st = progress.get(key) if deep else None
+            if st == "done":
                 continue
+            start_page = int(st) + 1 if isinstance(st, int) else 1
             api_url = with_price(base_url, band[0], band[1]) if band else base_url
             label = f"{name}{_band_label(band)}"
 
-            total, blocked, unit_sent = _scan_unit(api, api_url, band_pages, page_delay, conn, label)
+            def mark_page(pg: int, _k=key) -> None:
+                if deep:
+                    progress[_k] = pg
+                    _save_progress(progress)
+
+            total, unit_sent, completed = _scan_unit(
+                api, api_url, band_pages, page_delay, conn, label, start_page, mark_page)
             sent += unit_sent
-
-            if blocked:
-                consecutive_blocks += 1
-                log(f"[{label}] заблокирован (подряд: {consecutive_blocks})")
-                if consecutive_blocks >= config.RECOVER_AFTER_BLOCKS and api.recover():
-                    consecutive_blocks = 0
-                time.sleep(random.uniform(*region_delay))
-                continue
-
-            consecutive_blocks = 0
             collected += total
             region_hit = region_hit or total > 0
-            if deep:
-                _mark_progress(done, key)
-            log(f"[{label}] объявлений: {total}")
-            time.sleep(random.uniform(*region_delay))
+
+            if completed:
+                if deep:
+                    progress[key] = "done"
+                    _save_progress(progress)
+                log(f"[{label}] объявлений: {total} (полоса пройдена)")
+                time.sleep(random.uniform(*region_delay))
+            else:
+                # дожать полосу не удалось (баланс/предохранитель) — позиция сохранена,
+                # доберём при следующем запуске. Дальше в этом проходе тоже не сможем.
+                log(f"[{label}] прервано на стр.{progress.get(key)} — доберу позже")
+                stopped = True
+                break
 
         if region_hit:
             nonzero_regions += 1
@@ -131,21 +155,26 @@ def run_once() -> int:
     return sent
 
 
-def _scan_unit(api: AvitoApi, api_url: str, pages: int, page_delay, conn,
-               label: str) -> tuple[int, bool, int]:
-    """Пролистать один юнит (регион или регион×полоса). → (собрано, заблокирован?, отправлено)."""
+def _scan_unit(api: AvitoApi, api_url: str, max_pages: int, page_delay, conn,
+               label: str, start_page: int, mark_page) -> tuple[int, int, bool]:
+    """Полностью пролистать полосу [start_page..max_pages], ДОЖИМАЯ через баны:
+    бан на странице N → смена IP → продолжаем ТУ ЖЕ страницу (не бросаем полосу и
+    не начинаем сначала). → (собрано, отправлено, полоса_завершена?)."""
     total = 0
     unit_sent = 0
-    for page in range(1, pages + 1):
+    page = start_page
+    while page <= max_pages:
         try:
             listings = api.fetch_page(api_url, page)
         except AvitoBlocked:
-            return total, True, unit_sent
+            if _recover_blocking(api, label):
+                continue  # свежий IP → повторяем ТУ ЖЕ страницу, полосу не теряем
+            return total, unit_sent, False  # восстановиться нельзя → полоса НЕ завершена
         except Exception as e:
             log(f"[{label}] стр.{page}: {type(e).__name__}: {e}")
             break
         if not listings:
-            break
+            break  # полоса исчерпана (пустая страница)
         total += len(listings)
 
         for listing in listings:
@@ -166,8 +195,10 @@ def _scan_unit(api: AvitoApi, api_url: str, pages: int, page_delay, conn,
                 unit_sent += 1
                 log(f"  ✅ {result.reason} — {listing.title}")
 
+        mark_page(page)  # постраничный чекпоинт — рестарт продолжит с этой точки
+        page += 1
         time.sleep(random.uniform(*page_delay))  # темп между страницами
-    return total, False, unit_sent
+    return total, unit_sent, True  # полоса завершена/исчерпана
 
 
 def _update_health(collected: int, nonzero_regions: int, total_regions: int,

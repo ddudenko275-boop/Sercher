@@ -221,89 +221,60 @@ class AvitoApi:
         return False
 
     def recover(self) -> bool:
-        """Восстановление после стойкого бана. ПОКУПКА cookies — ТОЛЬКО НА НОВЫЙ IP.
-
-        Новые cookies на том же живом IP не лечат бан (у Авито бан IP-шный), поэтому
-        весь контроль трат — в ПОЛИТИКЕ РОТАЦИИ, адаптивной по времени жизни IP:
-          • IP умер мгновенно (<60с) — плохая раздача пула, переротация по базе, без штрафа;
-          • пожил и умер (мин) — горит от НАШЕЙ нагрузки → удваиваем кулдаун (бэкоф),
-            не бьёмся в ту же стену (иначе утренние 35 покупок);
-          • прожил >2ч — нагрузка ок → сбрасываем кулдаун к базе.
-        Дневной потолок покупок — теперь предохранитель от бага, а не регулятор.
+        """Восстановление после бана. КЛЮЧЕВОЕ (проверено эмпирически): cookies
+        ПЕРЕНОСЯТСЯ на новый IP. Поэтому на бан просто МЕНЯЕМ IP (бесплатно, changeip),
+        а cookies покупаем ТОЛЬКО когда протухли (~11ч) или их нет. Итог: ~2 покупки
+        cookies/сутки вместо десятков — ротаций сколько угодно, они ничего не стоят.
+        Ротацию держим по кулдауну (уважить лимит смены IP у mobileproxy).
         """
         now = time.time()
         if now - self._last_recover < config.RECOVER_MIN_INTERVAL_SEC:
             return False
         self._last_recover = now
         if self._recover_count >= config.MAX_RECOVERIES_PER_RUN:
-            self.degraded_reason = "исчерпан лимит авто-восстановлений за проход"
+            self.degraded_reason = "исчерпан лимит восстановлений за проход"
             return False
 
         st = health.load()
-        ip_born = float(st.get("last_rotation", 0) or 0)
-        cooldown = float(st.get("rotate_cooldown", config.ROTATE_COOLDOWN_SEC)
-                         or config.ROTATE_COOLDOWN_SEC)
-        lifetime = (now - ip_born) if ip_born else 1e9
+        last_rot = float(st.get("last_rotation", 0) or 0)
+        cooldown = (config.DEEP_ROTATE_COOLDOWN_SEC if getattr(config, "DEEP_SWEEP", False)
+                    else config.ROTATE_COOLDOWN_SEC)
+        if now - last_rot < cooldown:
+            return False  # окно ротации ещё не пришло — вызывающий подождёт и повторит
 
-        # Адаптация кулдауна по времени жизни ПРОШЛОГО IP.
-        if getattr(config, "DEEP_SWEEP", False):
-            cooldown = config.DEEP_ROTATE_COOLDOWN_SEC       # прочёс: отзывчиво, без бэкофа
-        elif lifetime > config.ROTATE_LIFETIME_RESET:
-            cooldown = config.ROTATE_COOLDOWN_SEC            # жил долго — база
-        elif lifetime >= config.ROTATE_INSTANT_DEATH:
-            cooldown = min(cooldown * 2, config.ROTATE_COOLDOWN_MAX)  # горит от нагрузки — бэкоф
-            log(f"[recover] IP прожил {lifetime / 60:.0f} мин — бэкоф ротации до {cooldown / 60:.0f} мин")
-        # lifetime < INSTANT_DEATH: плохой IP из пула — кулдаун не меняем
-
-        def _persist():
-            st["rotate_cooldown"] = cooldown
-            health.save(st)
-
-        # ПРЕДОХРАНИТЕЛЬ. В обычном мониторе — от бага; в прочёсе — осознанный потолок трат.
-        budget = (config.DEEP_MAX_REBUYS_PER_DAY if getattr(config, "DEEP_SWEEP", False)
-                  else config.MAX_REBUYS_PER_DAY)
-        if self._purchases_today() >= budget:
-            self.degraded_reason = (f"ПРЕДОХРАНИТЕЛЬ: {budget} покупок cookies/сутки — "
-                                    f"дальше не трачу (в прочёсе это ~{budget * 3} ₽)")
-            log(f"[recover] {self.degraded_reason}")
-            _persist()
+        # 1) Сменить IP — БЕСПЛАТНО (cookies переносятся на новый IP, это лечит бан).
+        if not self._rotate_ip():
             return False
-
-        bal = self._balance()
-        if bal is not None and bal < config.MIN_SPFA_BALANCE:
-            self.degraded_reason = f"баланс spfa {bal:.0f}₽ — пополни, cookies не купить"
-            log(f"[recover] {self.degraded_reason}")
-            _persist()
-            return False
-
-        cur_ip = self._exit_ip()
-        if cur_ip and self._exit_ip_saved and cur_ip != self._exit_ip_saved:
-            # прокси сам сменил IP — законная покупка «после смены IP», changeip НЕ нужен
-            log(f"[recover] прокси сменил IP сам ({self._exit_ip_saved}→{cur_ip}) — беру cookies")
-        else:
-            # тот же IP забанен → нужна ротация, но по кулдауну (мгновенную смерть гейтим базой)
-            gate = config.ROTATE_COOLDOWN_SEC if lifetime < config.ROTATE_INSTANT_DEATH else cooldown
-            if lifetime < gate:
-                self.degraded_reason = f"ротация через ~{(gate - lifetime) / 60:.0f} мин (бэкоф) — денег не жгу"
-                log(f"[recover] жду окна ротации ещё ~{gate - lifetime:.0f}с (IP горят от темпа)")
-                _persist()
-                return False
-            if not self._rotate_ip():
-                _persist()
-                return False
-
-        # IP новый (наш changeip или самопроизвольный) → фиксируем «рождение» и покупаем cookies
         st["last_rotation"] = now
-        _persist()
-        try:
-            self._buy_cookies()
-            self._recover_count += 1
-            log("[recover] cookies перевыпущены под новый IP — продолжаю")
-            return True
-        except Exception as e:
-            self.degraded_reason = f"spfa не отдал cookies: {e}"
-            log(f"[recover] {self.degraded_reason}")
-            return False
+        health.save(st)
+
+        # 2) Cookies покупаем ТОЛЬКО если протухли/их нет — НЕ при каждой ротации.
+        age = self.cookie_age()
+        need_cookies = (not self._cookies) or (age is not None and age > config.COOKIE_MAX_AGE_SEC)
+        if need_cookies:
+            budget = (config.DEEP_MAX_REBUYS_PER_DAY if getattr(config, "DEEP_SWEEP", False)
+                      else config.MAX_REBUYS_PER_DAY)
+            if self._purchases_today() >= budget:
+                self.degraded_reason = f"ПРЕДОХРАНИТЕЛЬ: {budget} покупок cookies/сутки (сработал = баг)"
+                log(f"[recover] {self.degraded_reason}")
+                return False
+            bal = self._balance()
+            if bal is not None and bal < config.MIN_SPFA_BALANCE:
+                self.degraded_reason = f"баланс spfa {bal:.0f}₽ — пополни"
+                log(f"[recover] {self.degraded_reason}")
+                return False
+            try:
+                self._buy_cookies()
+                log("[recover] IP сменён + cookies обновлены (протухли) — продолжаю")
+            except Exception as e:
+                self.degraded_reason = f"spfa не отдал cookies: {e}"
+                log(f"[recover] {self.degraded_reason}")
+                return False
+        else:
+            log("[recover] IP сменён, cookies прежние (переносятся) — 0 ₽, продолжаю")
+
+        self._recover_count += 1
+        return True
 
     def _session(self) -> "creq.Session":
         if not self._cookies:
