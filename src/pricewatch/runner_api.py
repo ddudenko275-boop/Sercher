@@ -9,11 +9,13 @@ JSON с описаниями → фильтр (585 + цена за грамм) �
 
 from __future__ import annotations
 
+import json
 import random
 import time
+from pathlib import Path
 
 from . import config, health, notify, store
-from .avito_api import AvitoApi, AvitoBlocked, convert_search_url
+from .avito_api import AvitoApi, AvitoBlocked, convert_search_url, with_price
 from .filter import evaluate
 from .logutil import log
 
@@ -30,97 +32,137 @@ def _all_regions() -> list[tuple[str, str]]:
     return out
 
 
+def _band_label(band) -> str:
+    if not band:
+        return ""
+    lo, hi = band
+    return f" {lo // 1000}k-{'∞' if hi is None else str(hi // 1000) + 'k'}"
+
+
+def _load_progress() -> set[str]:
+    p = Path(config.SWEEP_PROGRESS_PATH)
+    if p.exists():
+        try:
+            return set(json.loads(p.read_text("utf-8")))
+        except Exception:
+            return set()
+    return set()
+
+
+def _mark_progress(done: set[str], key: str) -> None:
+    done.add(key)
+    p = Path(config.SWEEP_PROGRESS_PATH)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(sorted(done), ensure_ascii=False), "utf-8")
+
+
 def run_once() -> int:
     conn = store.connect(config.DB_PATH)
     first_run = store.is_empty(conn)
     deep = getattr(config, "DEEP_SWEEP", False)
-    if deep:
-        pages = config.MAX_PAGES_DEEP  # разовый глубокий прочёс всего рынка
-        print("РЕЖИМ: глубокий прочёс — все страницы, круг за кругом с круга 0")
-    else:
-        pages = config.FIRST_RUN_PAGES if first_run else config.PAGES
-    # Для глубокого прочёса темп быстрее (разовый); для обычных проходов — спокойный.
+    pages = config.MAX_PAGES_DEEP if deep else (
+        config.FIRST_RUN_PAGES if first_run else config.PAGES)
+    # Глубокий прочёс: быстрее темп + ценовые полосы (обход лимита ~5000/запрос).
     page_delay = config.DEEP_PAGE_DELAY_SEC if deep else config.PAGE_DELAY_SEC
     region_delay = config.DEEP_REGION_DELAY_SEC if deep else config.REGION_DELAY_SEC
-    api = AvitoApi()
-    # Проактивно освежить cookies, если протухают (не ждём блокировки в проходе).
-    api.refresh_cookies_if_old()
+    bands = config.PRICE_BANDS if deep else [None]
 
-    # Небольшой случайный сдвиг старта — проходы не строго по расписанию.
+    api = AvitoApi()
+    api.refresh_cookies_if_old()  # не ждём блокировки протухших cookies в проходе
     time.sleep(random.uniform(*getattr(config, "START_JITTER_SEC", (0, 0))))
 
     regions = _all_regions()
-    log(f"Проход: регионов {len(regions)}, страниц/регион {pages}, первый запуск: {first_run}")
-    sent = 0
-    collected = 0        # всего собрано объявлений за проход
-    nonzero_regions = 0  # сколько регионов реально отдали данные (для heartbeat)
+    done = _load_progress() if deep else set()
+    if deep:
+        log(f"РЕЖИМ: глубокий прочёс с ценовыми полосами — {len(regions)} регионов "
+            f"× {len(bands)} полос, до {pages} стр/полоса (уже сделано: {len(done)})")
+    else:
+        log(f"Проход: регионов {len(regions)}, страниц/регион {pages}, "
+            f"первый запуск: {first_run}")
+
+    sent = collected = nonzero_regions = 0
     consecutive_blocks = 0  # блоков подряд — копим до порога, потом восстанавливаемся
 
     for name, slug in regions:
-        search = config.SEARCH_URL_TEMPLATE.format(region=slug)
         try:
-            api_url = convert_search_url(search)
+            base_url = convert_search_url(config.SEARCH_URL_TEMPLATE.format(region=slug))
         except Exception as e:
             log(f"[{name}] API-URL не получен: {e}")
             continue
 
-        total = 0
-        blocked = False
-        for page in range(1, pages + 1):
-            try:
-                listings = api.fetch_page(api_url, page)
-            except AvitoBlocked:
-                blocked = True
-                break
-            except Exception as e:
-                log(f"[{name}] стр.{page}: {type(e).__name__}: {e}")
-                break
-            if not listings:
-                break
-            total += len(listings)
+        region_hit = False
+        for band in bands:
+            key = f"{slug}|{band[0]}|{band[1]}" if band else slug
+            if deep and key in done:
+                continue
+            api_url = with_price(base_url, band[0], band[1]) if band else base_url
+            label = f"{name}{_band_label(band)}"
 
-            for listing in listings:
-                seen, prev_price = store.get_prev_price(conn, listing.id)
-                if seen:
-                    if (listing.price is None or prev_price is None
-                            or listing.price >= prev_price):
-                        continue
-                    event = "price_drop"
-                else:
-                    event = "new"
+            total, blocked, unit_sent = _scan_unit(api, api_url, pages, page_delay, conn, label)
+            sent += unit_sent
 
-                result = evaluate(listing)
-                store.record(conn, listing)
-
-                if result.matched:
-                    notify.send(notify.format_message(listing, result, event))
-                    sent += 1
-                    log(f"  ✅ {result.reason} — {listing.title}")
-
-            time.sleep(random.uniform(*page_delay))  # темп между страницами
-
-        if blocked:
-            # Блок региона. Копим подряд; тратимся на восстановление только после
-            # порога — одиночный блок (рейт-лимит) не стоит денег.
-            consecutive_blocks += 1
-            log(f"[{name}] заблокирован (подряд: {consecutive_blocks})")
-            if consecutive_blocks >= config.RECOVER_AFTER_BLOCKS:
-                if api.recover():
+            if blocked:
+                consecutive_blocks += 1
+                log(f"[{label}] заблокирован (подряд: {consecutive_blocks})")
+                if consecutive_blocks >= config.RECOVER_AFTER_BLOCKS and api.recover():
                     consecutive_blocks = 0
-            time.sleep(random.uniform(*region_delay))
-            continue
+                time.sleep(random.uniform(*region_delay))
+                continue
 
-        consecutive_blocks = 0
-        collected += total
-        if total > 0:
+            consecutive_blocks = 0
+            collected += total
+            region_hit = region_hit or total > 0
+            if deep:
+                _mark_progress(done, key)
+            log(f"[{label}] объявлений: {total}")
+            time.sleep(random.uniform(*region_delay))
+
+        if region_hit:
             nonzero_regions += 1
-        log(f"[{name}] объявлений: {total}")
-        time.sleep(random.uniform(*region_delay))  # темп между регионами
 
     conn.close()
     _update_health(collected, nonzero_regions, len(regions), api)
     log(f"Отправлено уведомлений: {sent}")
     return sent
+
+
+def _scan_unit(api: AvitoApi, api_url: str, pages: int, page_delay, conn,
+               label: str) -> tuple[int, bool, int]:
+    """Пролистать один юнит (регион или регион×полоса). → (собрано, заблокирован?, отправлено)."""
+    total = 0
+    unit_sent = 0
+    for page in range(1, pages + 1):
+        try:
+            listings = api.fetch_page(api_url, page)
+        except AvitoBlocked:
+            return total, True, unit_sent
+        except Exception as e:
+            log(f"[{label}] стр.{page}: {type(e).__name__}: {e}")
+            break
+        if not listings:
+            break
+        total += len(listings)
+
+        for listing in listings:
+            seen, prev_price = store.get_prev_price(conn, listing.id)
+            if seen:
+                if (listing.price is None or prev_price is None
+                        or listing.price >= prev_price):
+                    continue
+                event = "price_drop"
+            else:
+                event = "new"
+
+            result = evaluate(listing)
+            store.record(conn, listing)
+
+            if result.matched:
+                notify.send(notify.format_message(listing, result, event))
+                unit_sent += 1
+                log(f"  ✅ {result.reason} — {listing.title}")
+
+        time.sleep(random.uniform(*page_delay))  # темп между страницами
+    return total, False, unit_sent
 
 
 def _update_health(collected: int, nonzero_regions: int, total_regions: int,

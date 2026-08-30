@@ -319,6 +319,26 @@ class AvitoApi:
         return []
 
 
+def with_price(api_url: str, pmin: int | None, pmax: int | None) -> str:
+    """Добавить к API-URL ценовую полосу (priceMin/priceMax) для глубокого прочёса.
+
+    priceMax ставим всегда (при None — заглушка 99999999): пара priceMin+priceMax
+    подтверждена рабочей, а одиночный priceMin — нет.
+    """
+    parts = urlsplit(api_url)
+    query = [
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k not in ("priceMin", "priceMax")
+    ]
+    if pmin is not None:
+        query.append(("priceMin", str(pmin)))
+    query.append(("priceMax", str(pmax if pmax is not None else 99_999_999)))
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
+
+
 def _with_page(api_url: str, page: int) -> str:
     parts = urlsplit(api_url)
     query = [

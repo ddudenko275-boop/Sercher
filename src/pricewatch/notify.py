@@ -66,17 +66,27 @@ def _send_to(text: str, chat_ids: list[str], html: bool) -> bool:
     ok_all = True
     for chat_id in chat_ids:
         sent = False
-        for attempt in range(3):  # сеть/лимит — пара повторов
+        for attempt in range(5):  # сеть/флуд-лимит — повторы
             try:
                 r = requests.post(url, data={**payload_base, "chat_id": chat_id}, timeout=20)
-                if r.json().get("ok"):
+                data = r.json()
+                if data.get("ok"):
                     sent = True
                     break
-                print(f"[telegram] {chat_id}: не ок — {r.json().get('description')}")
+                # Флуд-контроль Telegram: честно ждём retry_after, не теряем сообщение
+                # и не злим лимит (иначе забанят бота — чего пользователь не хочет).
+                retry_after = (data.get("parameters") or {}).get("retry_after")
+                if retry_after:
+                    print(f"[telegram] флуд-лимит, жду {retry_after}с")
+                    time.sleep(float(retry_after) + 1)
+                    continue
+                print(f"[telegram] {chat_id}: не ок — {data.get('description')}")
             except requests.RequestException as e:
                 print(f"[telegram] {chat_id}: ошибка отправки — {e}")
             time.sleep(2)
         ok_all = ok_all and sent
+        # Пауза между получателями/сообщениями — держим темп ниже флуд-порога.
+        time.sleep(getattr(config, "TELEGRAM_SEND_PACE_SEC", 0))
     return ok_all
 
 
