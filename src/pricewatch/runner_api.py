@@ -35,7 +35,7 @@ def _all_regions() -> list[tuple[str, str]]:
 def _band_label(band) -> str:
     if not band:
         return ""
-    lo, hi = band
+    lo, hi = band[0], band[1]
     return f" {lo // 1000}k-{'∞' if hi is None else str(hi // 1000) + 'k'}"
 
 
@@ -92,13 +92,14 @@ def run_once() -> int:
 
         region_hit = False
         for band in bands:
+            band_pages = band[2] if band else pages  # своя глубина у каждой полосы
             key = f"{slug}|{band[0]}|{band[1]}" if band else slug
             if deep and key in done:
                 continue
             api_url = with_price(base_url, band[0], band[1]) if band else base_url
             label = f"{name}{_band_label(band)}"
 
-            total, blocked, unit_sent = _scan_unit(api, api_url, pages, page_delay, conn, label)
+            total, blocked, unit_sent = _scan_unit(api, api_url, band_pages, page_delay, conn, label)
             sent += unit_sent
 
             if blocked:

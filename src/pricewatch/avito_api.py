@@ -321,21 +321,30 @@ class AvitoApi:
     # --- выдача ---
     def fetch_page(self, api_url: str, page: int) -> list[Listing]:
         url = _with_page(api_url, page)
-        # Блок (403/429/439) при листании — это чаще РЕЙТ-ЛИМИТ Авито («притормози»),
-        # а не бан насмерть и не протухшие cookies. Он проходит сам за десятки секунд.
-        # Поэтому сначала ЖДЁМ и повторяем ТЕМИ ЖЕ cookies (0 ₽); эскалируем в
-        # AvitoBlocked (→ платное восстановление) только если блок пережил ожидание.
-        for wait in (0, 20, 45, 90):
-            if wait:
-                time.sleep(wait)
-            s = self._session()
-            r = s.get(url, timeout=40)
+        # Различаем два вида блока:
+        #   429 = РЕЙТ-ЛИМИТ («притормози») — проходит сам, ждём и повторяем ТЕМИ ЖЕ
+        #         cookies (0 ₽); перевыпуск бесполезен (IP тот же).
+        #   403/439 = БАН IP — ожидание НЕ помогает, эскалируем БЫСТРО (иначе теряем
+        #         минуты на мёртвом IP), раннер сменит IP.
+        soft = [15, 30]  # ожидания для 429
+        si = 0
+        for attempt in range(4):
+            r = self._session().get(url, timeout=40)
             if r.status_code == 200:
                 return _items_to_listings(r.json())
-            if r.status_code in (403, 429, 439):
-                continue
+            if r.status_code == 429:
+                if si < len(soft):
+                    time.sleep(soft[si])
+                    si += 1
+                    continue
+                raise AvitoBlocked("429 (рейт-лимит не прошёл)")
+            if r.status_code in (403, 439):
+                if attempt == 0:
+                    time.sleep(8)  # один короткий ретрай на случай «мигания» антибота
+                    continue
+                raise AvitoBlocked(f"HTTP {r.status_code} (бан IP)")
             r.raise_for_status()
-        raise AvitoBlocked("блок пережил ожидание (нужно восстановление)")
+        raise AvitoBlocked("блок не прошёл")
 
 
 def with_price(api_url: str, pmin: int | None, pmax: int | None) -> str:
