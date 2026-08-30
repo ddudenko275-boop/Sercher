@@ -29,7 +29,11 @@ def evaluate(listing: Listing) -> MatchResult:
     per_gram = extract.is_price_per_gram(text)
     weight, ambiguous = extract.parse_weight_grams(text)
 
-    # Только чистое золото — украшения со вставками/камнями исключаем.
+    # Нужны ТОЛЬКО чистые золотые украшения. Отсекаем всё, что явно не оно:
+    if extract.is_watch(text):
+        return MatchResult(False, "часы, не украшение")
+    if extract.is_other_metal(text):
+        return MatchResult(False, "не чистое золото (серебро/сталь/позолота)")
     if config.EXCLUDE_STONES and extract.has_stones(text):
         return MatchResult(False, "со вставками/камнями", weight_g=weight)
 

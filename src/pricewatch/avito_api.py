@@ -246,7 +246,9 @@ class AvitoApi:
         lifetime = (now - ip_born) if ip_born else 1e9
 
         # Адаптация кулдауна по времени жизни ПРОШЛОГО IP.
-        if lifetime > config.ROTATE_LIFETIME_RESET:
+        if getattr(config, "DEEP_SWEEP", False):
+            cooldown = config.DEEP_ROTATE_COOLDOWN_SEC       # прочёс: отзывчиво, без бэкофа
+        elif lifetime > config.ROTATE_LIFETIME_RESET:
             cooldown = config.ROTATE_COOLDOWN_SEC            # жил долго — база
         elif lifetime >= config.ROTATE_INSTANT_DEATH:
             cooldown = min(cooldown * 2, config.ROTATE_COOLDOWN_MAX)  # горит от нагрузки — бэкоф

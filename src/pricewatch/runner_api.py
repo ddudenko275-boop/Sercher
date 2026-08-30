@@ -10,6 +10,7 @@ JSON с описаниями → фильтр (585 + цена за грамм) �
 from __future__ import annotations
 
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -72,6 +73,9 @@ def run_once() -> int:
     time.sleep(random.uniform(*getattr(config, "START_JITTER_SEC", (0, 0))))
 
     regions = _all_regions()
+    # Фокус на круге 0 (PRICEWATCH_RING0=1) — эффективный первый глубокий анализ.
+    if deep and os.getenv("PRICEWATCH_RING0"):
+        regions = list(config.REGION_RINGS[0].items())
     done = _load_progress() if deep else set()
     if deep:
         log(f"РЕЖИМ: глубокий прочёс с ценовыми полосами — {len(regions)} регионов "
