@@ -92,6 +92,11 @@ def run_once() -> int:
     # и в обычном мониторе). Пусто — все круги.
     rings_env = os.getenv("PRICEWATCH_RINGS")
     regions = _all_regions(int(rings_env) if rings_env else None)
+    # Отдельный прогон по ОДНОЙ кастомной ссылке (напр. «Ростов + радиус 150 км»):
+    # PRICEWATCH_SEARCH_URL — полная ссылка поиска Авито. Тогда регионы не при чём.
+    custom_url = os.getenv("PRICEWATCH_SEARCH_URL")
+    if custom_url:
+        regions = [(os.getenv("PRICEWATCH_REGION_NAME", "Ростов+радиус"), custom_url)]
     progress = _load_progress() if deep else {}
     if deep:
         log(f"РЕЖИМ: глубокий прочёс с ценовыми полосами — {len(regions)} регионов "
@@ -107,8 +112,10 @@ def run_once() -> int:
     for name, slug in regions:
         if stopped:
             break
+        # slug — это слуг региона ИЛИ уже готовая ссылка поиска (кастомный прогон).
+        search = slug if slug.startswith("http") else config.SEARCH_URL_TEMPLATE.format(region=slug)
         try:
-            base_url = convert_search_url(config.SEARCH_URL_TEMPLATE.format(region=slug))
+            base_url = convert_search_url(search)
         except Exception as e:
             log(f"[{name}] API-URL не получен: {e}")
             continue

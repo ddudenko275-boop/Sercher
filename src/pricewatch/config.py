@@ -116,7 +116,7 @@ PRICE_BANDS = [
     (30_000, 100_000, 60),      # дешёвая масса (редко ≥35 г, ниже лома): только по верхам
 ]
 # Файл прогресса свипа (регион×полоса) — рестарт продолжает, а не пережигает страницы.
-SWEEP_PROGRESS_PATH = "data/sweep_progress.json"
+SWEEP_PROGRESS_PATH = os.getenv("PRICEWATCH_PROGRESS", "data/sweep_progress.json")
 
 # Пауза между отправками в Telegram — чтобы сотни находок за свип НЕ упёрлись во
 # флуд-лимит и не привели к блокировке бота. ~1/сек на чат безопасно.
@@ -146,7 +146,7 @@ MAX_DETAIL_FETCHES = 6
 
 # --- Фильтр (наша уникальная логика, которой нет у Авито) ---
 PROBA = 585                 # проба золота
-MAX_PRICE_PER_GRAM = 7700   # ₽/г: берём объявления дешевле этого порога за грамм
+MAX_PRICE_PER_GRAM = int(os.getenv("PRICEWATCH_MAX_PPG", "7700"))  # ₽/г: порог (env — под отдельный прогон)
 # Ниже этого ₽/г — подозрительно (дешевле лома ~3500–4000): помечаем как возможный
 # развод, но всё равно шлём (пользователь просил показывать с предупреждением).
 SUSPICIOUS_PRICE_PER_GRAM = 2500
@@ -184,7 +184,9 @@ MIN_WEIGHT_G = 0.1
 MAX_WEIGHT_G = 1000.0
 
 # --- Хранилище ---
-DB_PATH = "data/seen.db"  # локальная база дедупликации (в .gitignore)
+# База дедупликации. Env PRICEWATCH_DB — отдельный прогон со своей базой,
+# не трогая основную (напр. data/seen_rostov.db).
+DB_PATH = os.getenv("PRICEWATCH_DB", "data/seen.db")
 
 # --- Сбор через API Авито (spfa cookies + curl_cffi) ---
 # Ключ сервиса spfa.pro (даёт cookies под наш прокси-IP). Кладём в .env.
@@ -242,7 +244,7 @@ MIN_SPFA_BALANCE = 6.0
 # Если сбор «пустой» дольше этого — один тревожный алерт владельцу в Telegram.
 ALERT_AFTER_SEC = 2 * 3600
 # Файл состояния здоровья монитора (last_ok, last_rotation, alerted).
-HEALTH_PATH = "data/health.json"
+HEALTH_PATH = os.getenv("PRICEWATCH_HEALTH", "data/health.json")
 
 # --- Telegram (создаётся у @BotFather; кладём в .env, а не в код) ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
