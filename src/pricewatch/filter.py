@@ -30,6 +30,8 @@ def evaluate(listing: Listing) -> MatchResult:
     weight, ambiguous = extract.parse_weight_grams(text)
 
     # Нужны ТОЛЬКО чистые золотые украшения от ПРОДАВЦА. Отсекаем всё, что не оно:
+    if extract.is_junk(text):
+        return MatchResult(False, "скам/дропшип или люкс-бренд со вставками")
     if extract.is_buyer(text):
         return MatchResult(False, "скупщик (покупает золото, не продаёт)")
     if extract.is_watch(text):
