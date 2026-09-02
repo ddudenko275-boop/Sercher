@@ -97,6 +97,12 @@ def run_once() -> int:
     custom_url = os.getenv("PRICEWATCH_SEARCH_URL")
     if custom_url:
         regions = [(os.getenv("PRICEWATCH_REGION_NAME", "Ростов+радиус"), custom_url)]
+    # Свой список областей (слуги через запятую) — для отдельного прогона по югу.
+    regions_env = os.getenv("PRICEWATCH_REGIONS")
+    if regions_env:
+        _names = {slug: name for ring in config.REGION_RINGS for name, slug in ring.items()}
+        regions = [(_names.get(s.strip(), s.strip()), s.strip())
+                   for s in regions_env.split(",") if s.strip()]
     progress = _load_progress() if deep else {}
     if deep:
         log(f"РЕЖИМ: глубокий прочёс с ценовыми полосами — {len(regions)} регионов "
