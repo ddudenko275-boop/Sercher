@@ -159,7 +159,8 @@ MIN_PLAUSIBLE_PRICE_PER_GRAM = 1000
 # фианиты, циркон и т.п.). «Без вставок/камней» при этом не считается наличием.
 EXCLUDE_STONES = True
 # Минимальный вес изделия, г (нужен вес из описания). 0 — не ограничивать.
-MIN_ITEM_WEIGHT_G = 35.0
+# Env PRICEWATCH_MIN_WEIGHT — под конкретный прогон/монитор (напр. 25).
+MIN_ITEM_WEIGHT_G = float(os.getenv("PRICEWATCH_MIN_WEIGHT", "35"))
 
 # --- География и доставка ---
 DESTINATION_CITY = "Ростов-на-Дону"  # куда заказываем
