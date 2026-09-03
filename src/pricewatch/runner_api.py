@@ -114,6 +114,7 @@ def run_once() -> int:
 
     sent = collected = nonzero_regions = 0
     stopped = False  # восстановление стало невозможным (баланс/предохранитель) — прерываем
+    scanned_any = False  # сканировали ли хоть одну полосу (не пропущенную как done)
 
     for name, slug in regions:
         if stopped:
@@ -133,6 +134,7 @@ def run_once() -> int:
             st = progress.get(key) if deep else None
             if st == "done":
                 continue
+            scanned_any = True
             start_page = int(st) + 1 if isinstance(st, int) else 1
             api_url = with_price(base_url, band[0], band[1]) if band else base_url
             label = f"{name}{_band_label(band)}"
@@ -165,7 +167,13 @@ def run_once() -> int:
             nonzero_regions += 1
 
     conn.close()
-    _update_health(collected, nonzero_regions, len(regions), api)
+    # Прочёс ПОЛНОСТЬЮ завершён (все полосы done, сканировать было нечего) — это НЕ
+    # поломка: пишем метку (keeper по ней остановится) и НЕ шлём тревогу.
+    sweep_complete = deep and not scanned_any and not stopped
+    if sweep_complete:
+        Path(config.SWEEP_PROGRESS_PATH + ".done").write_text("done", "utf-8")
+        log("Прочёс полностью завершён — все полосы пройдены (keeper остановится).")
+    _update_health(collected, nonzero_regions, len(regions), api, sweep_complete)
     log(f"Отправлено уведомлений: {sent}")
     return sent
 
@@ -217,15 +225,18 @@ def _scan_unit(api: AvitoApi, api_url: str, max_pages: int, page_delay, conn,
 
 
 def _update_health(collected: int, nonzero_regions: int, total_regions: int,
-                   api: AvitoApi) -> None:
+                   api: AvitoApi, sweep_complete: bool = False) -> None:
     """Обновить здоровье и, если сбор реально деградировал, один раз предупредить.
 
     «Здоров» = данные пришли хотя бы с ПОЛОВИНЫ регионов (или собрано ≥100). Иначе
     один живой регион среди сплошных нулей больше НЕ маскирует деградацию (был баг).
+    sweep_complete=True — прочёс полностью пройден, сканировать было нечего: это НЕ
+    поломка, тревогу НЕ шлём (иначе завершённый прогон вечно шлёт «0 регионов»).
     """
     import time as _t
 
-    healthy = nonzero_regions >= max(1, total_regions // 2) or collected >= 100
+    healthy = (sweep_complete or nonzero_regions >= max(1, total_regions // 2)
+               or collected >= 100)
     state = health.load()
     now = _t.time()
     state.setdefault("last_ok", now)
