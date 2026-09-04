@@ -313,7 +313,17 @@ class AvitoApi:
             r = self._session().get(url, timeout=40)
             if r.status_code == 200:
                 self._rotations_since_success = 0  # fetch удался — cookies живы
-                return _items_to_listings(r.json())
+                j = r.json()
+                items = _items_to_listings(j)
+                # Пустая 1-я страница при totalCount>0 — это МЯГКИЙ БЛОК (антибот
+                # вернул пусто), а не конец полосы. Иначе полоса ошибочно помечается
+                # «пройдена» с 0. Эскалируем как блок → раннер сменит IP и переберёт.
+                if not items and page == 1 and _total_count(j):
+                    if attempt == 0:
+                        time.sleep(8)
+                        continue
+                    raise AvitoBlocked("стр.1 пуста при totalCount>0 (мягкий блок)")
+                return items
             if r.status_code == 429:
                 if si < len(soft):
                     time.sleep(soft[si])
@@ -360,6 +370,24 @@ def _with_page(api_url: str, page: int) -> str:
     return urlunsplit(
         (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
     )
+
+
+def _total_count(payload) -> int:
+    """Общее число результатов по запросу (поле totalCount в JSON). 0 — если нет."""
+    if isinstance(payload, dict):
+        v = payload.get("totalCount")
+        if isinstance(v, int):
+            return v
+        for x in payload.values():
+            r = _total_count(x)
+            if r:
+                return r
+    elif isinstance(payload, list):
+        for x in payload:
+            r = _total_count(x)
+            if r:
+                return r
+    return 0
 
 
 def _items_to_listings(payload: dict) -> list[Listing]:
